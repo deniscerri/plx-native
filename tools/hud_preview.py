@@ -33,6 +33,7 @@ LONG_TITLES = {
     "ru": "Необычайно длинная глава, в которой последний дракон возвращается через заснеженные горы",
     "pl": "Niezwykle długi rozdział, w którym ostatni smok powraca przez zamarznięte góry",
     "nl": "Het buitengewoon lange hoofdstuk waarin de laatste draak over de bevroren bergen terugkeert",
+    "sq": "Kapitulli jashtëzakonisht i gjatë në të cilin dragoi i fundit kthehet përmes maleve të ngrira",
 }
 
 
