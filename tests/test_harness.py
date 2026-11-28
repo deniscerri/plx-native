@@ -462,15 +462,15 @@ class ReplayFixtures(unittest.TestCase):
         """Actual CLI and actual guard, without executing any outbound operation."""
         source = os.path.join(self.FIXTURES, 'v13-owned-input-content')
         expected = {
-            'manifest.json': '1929ede78c012ca95d429a4198e59b05fa3510b342e1145bef5c9eb99b80ec23',
-            'rec-0000.jsonl': '373369a73b6f0cfb92f88f8fbdb75bc0a0fee6a0eb5f0835d5e937473163aa5f',
+            'manifest.json': 'f9adabb20df57e315ddc8fd0867b9db39c300ca4aeaeb2a3a94d1f1c3b071f06',
+            'rec-0000.jsonl': '547a2bc225dd1ece202640e96d39d9cd18f7c9010df978e390ea6ee1dd8ec041',
         }
         for name, digest in expected.items():
             with open(os.path.join(source, name), 'rb') as f:
                 self.assertEqual(hashlib.sha256(f.read()).hexdigest(), digest)
         with open(os.path.join(source, 'manifest.json'), encoding='utf-8') as f:
             original = json.load(f)
-        self.assertEqual((original['schema'], original['state_fp']), (3, 9159521251572352515))
+        self.assertEqual((original['schema'], original['state_fp']), (3, 9368468189897822625))
         with tempfile.TemporaryDirectory() as root:
             subprocess.run(['git', 'init', '-q', root], check=True)
             fixtures = os.path.join(root, 'tests', 'fixtures', 'replay')
@@ -485,7 +485,12 @@ class ReplayFixtures(unittest.TestCase):
             cases = [('producer', (), None, True),
                      ('raw-producer', ('anchor',), 'DELETE', True),
                      ('legal-enum', ('init', 'data', 'ui_preferences', 'subtitle_size'), 'large', True),
-                     ('unknown-fp', ('state_fp',), 9159521251572352516, False),
+                     ('unknown-fp', ('state_fp',), 15567541324829359260, False),
+                     ('pre-whats-on-v13-fp', ('state_fp',), 8363262880582770195, False),
+                     ('pre-channels-shelf-v13-fp', ('state_fp',), 2884821880834123965, False),
+                     ('pre-hero-row-v13-fp', ('state_fp',), 13368307521658900119, False),
+                     ('pre-library-v13-fp', ('state_fp',), 12734002143041661619, False),
+                     ('pre-watchlist-v13-fp', ('state_fp',), 9159521251572352515, False),
                      ('old-fp', ('state_fp',), 4239819007634745513, False),
                      ('other-old-fp', ('state_fp',), 13512213413816145485, False),
                      ('schema', ('schema',), 4, False),
@@ -700,8 +705,8 @@ class ReplayFixtures(unittest.TestCase):
             '6-settings-family': 4239819007634745513,
             '12-filmography-detail-return': 4239819007634745513,
             '12-filmography-detail-return-current': 13512213413816145485,
-            'v13-owned-input-content': 9159521251572352515,
-            '13-by-id-filmography': 9159521251572352515,
+            'v13-owned-input-content': 9368468189897822625,
+            '13-by-id-filmography': 9368468189897822625,
         })
 
     def _tool(self, *args):
@@ -10335,6 +10340,28 @@ impl PersonOwnerGateFixture {
         out = r.stdout + r.stderr
         self.assertEqual(r.returncode, 0, out)
         self.assertIn("ok — tmppath", out)
+
+    @_grades("menudoors")
+    def test_menudoors_gate_catches_a_menu_built_outside_the_component(self):
+        """Every menu goes through `plx_ui::menu::Menu`: `set_title(`, an assignment to `.compact`,
+        a `with_compact(` bool size class (the vocabulary is `menu::Class`), `PageStack::new` (turbofish too) and `PanelMotion::new` are spelled only in the component's own files.
+        RED: a ui-crate file (visibility cannot see one) that spells each fails `menudoors`; the
+        look-alikes `reset_title(`, a `.compact ==` comparison and `with_class(` (the sanctioned constructor) do not."""
+        r = self._plant(
+            "_check_deps_selftest_menudoors.rs",
+            "pub fn a(t: &mut X) { t.set_title(None); }\n"
+            "pub fn b(t: &mut X) { t.table.compact = true; }\n"
+            "pub fn c() { let _ = PageStack::new(); let _ = PanelMotion::new(); }\n"
+            "pub fn d() { let _ = PageStack::<u8, u8>::new(); }\n"
+            "pub fn e() -> TableView { TableView::with_compact(true) }\n"
+            "pub fn g() -> TableView { TableView::with_class(Class::Action) }\n"
+            "pub fn fine(t: &mut X) { t.reset_title(); if t.compact == true {} }\n",
+            crate_dir="ui",
+        )
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, out)
+        self.assertIn("menudoors: 5 line(s)", out)
+        self.assertIn("_check_deps_selftest_menudoors.rs", out)
 
     @_grades("cards")
     def test_cards_gate_catches_a_screen_assembling_its_own_strip(self):

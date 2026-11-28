@@ -213,6 +213,7 @@ fn the_subtitle_mode_readouts_are_pinned_in_every_language() {
         ("ru", "Если аудио не на языке субтитров"),
         ("nl", "Audio niet in ondertiteltaal"),
         ("ca", "Àudio en un altre idioma"),
+        ("hr", "Kada zvuk nije na jeziku titlova"),
         ("sq", "Audio në gjuhë tjetër"),
     ];
     for (tag, _) in WANT {

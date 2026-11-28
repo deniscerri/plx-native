@@ -748,6 +748,12 @@ fn chrome_presented<H: Host>(navigation: super::screen::NavPresentation, screen:
     presented.chrome_drawn().then_some(presented)
 }
 
+/// **Does this page wear the shared bar?** The registry's answer (`ScreenArg::chrome()`) on a screen the
+/// engine drives: the one test the chrome pass, the strip's stops and [`Dispatcher::bar_presented`] share.
+fn wears_bar<H: Host>(arg: &H::Arg, screen: &dyn Screen<H>) -> bool {
+    arg.chrome() == plx_machine::machine::Chrome::TabBar && screen.focus_source() == FocusSource::Engine
+}
+
 pub struct Split<'a, H: Host> {
     pub mounter: &'a mut dyn Mounter<H>,
     pub views: H::Views<'a>,
@@ -1139,7 +1145,19 @@ where
         self.request_with_return(from, op, self.return_state());
     }
 
+    /// The argument of a surface whose `Present` is PARKED for this frame's commit and that `which` names. A
+    /// surface mounts at the commit, once a frame, so a second request in the same frame cannot see the first in
+    /// the tree: whoever presents once-only surfaces asks here too, and folds or refuses the second request.
+    pub fn parked_present_mut(&mut self, which: impl Fn(&H::Arg) -> bool) -> Option<&mut H::Arg> {
+        self.parked.iter_mut().find_map(|(item, _)| match &mut item.fx {
+            Fx::Nav(NavOp::Present(arg)) if which(arg) => Some(arg),
+            _ => None,
+        })
+    }
+
     pub fn request_with_return(&mut self, from: MachineId, op: NavOp<H::Arg>, ret: ReturnState<H::Elem, H::Memory>) {
+        // A `ret` handed in from outside was captured by an earlier `return_state()`, which stamped the
+        // entry that held input then (`ret.captured`); the owner now is not a stand-in for it.
         self.parked.push((Stamped {
             from,
             fx: Fx::Nav(op),
@@ -1147,8 +1165,9 @@ where
     }
 
     fn park(&mut self, item: Stamped<H>) {
-        let ret = self.return_state();
-        self.parked.push((item, ret));
+        // The capturing owner travels with the op, stamped on the `ret` itself: where the `ret` lands is
+        // decided at commit, by `ret.captured`.
+        self.parked.push((item, self.return_state()));
     }
 
     /// `Lifecycle(0x103/0x104)`: `Suspend` down the tree at the next commit.
@@ -1172,6 +1191,17 @@ where
         self.page_stops.clear();
         self.page_debt = None;
         self.page_image_alpha = None;
+    }
+
+    /// **The shared bar as the top page presents it this frame, or `None` when it is not on screen**: the
+    /// top page wears the bar and [`chrome_presented`] keeps it (not fully faded by the nav or the page's
+    /// tuck). The chrome pass draws exactly when this is `Some`, so a status that lives on the bar (the
+    /// clock) asks THIS, not a list of routes. `navigation` is the rig's presentation of `self.nav`.
+    pub fn bar_presented(&self, navigation: super::screen::NavPresentation) -> Option<super::screen::NavPresentation> {
+        let top = self.nav.tabs.stack.top()?;
+        let screen = &*top.inst.as_ref()?.screen;
+        if !wears_bar::<H>(&top.arg, screen) { return None; }
+        chrome_presented::<H>(navigation, screen)
     }
 
     /// The top page's instance id, if mounted.
@@ -1383,6 +1413,7 @@ where
             scroll: 0.0,
             memory: self.owner_entry().and_then(|e| self.nav.entry(e))
                 .and_then(|e| e.inst.as_ref()).map(|i| i.screen.memory_at(self.focus())).unwrap_or_default(),
+            captured: self.owner_entry(),
         }
     }
 
@@ -2244,7 +2275,20 @@ where
         if self.nav.modals.scrims(page_alpha).iter().any(|(_,a)| *a >= 1.0) {
             layers.push(Layer { z:Z::DIM, rect:canvas(), blocks:true, revision:0, composite_alpha:None });
         }
+        if let Some(opaque) = self.nav.modals.first_opaque() {
+            for (index, surface) in self.nav.modals.surfaces.iter().enumerate().skip(opaque + 1) {
+                if surface.scrim_alpha(page_alpha) >= 1.0 {
+                    layers.push(Layer { z: Self::surface_scrim_z(index), rect: canvas(),
+                        blocks: true, revision: 0, composite_alpha: None });
+                }
+            }
+        }
         layers
+    }
+
+    fn surface_scrim_z(index: usize) -> super::frame::backdrop::Z {
+        use super::frame::backdrop::Z;
+        Z(Z::surface(index).0 - 1)
     }
 
     /// Product draw entry with a strict z ceiling; `Z::ALL` is the visible frame.
@@ -2374,6 +2418,23 @@ where
         // snapshot before), so nothing about it changes while the menu is up.
         self.settle_lift();
         let lift_parts = page_lift.map(|(entry, focus)| self.opener_parts(entry, focus));
+        // A page element's opener (a header pill) rides the page that carries it: the surface hanging from it is told where the
+        // control is DRAWN before every draw, as a bar member's is, so its morph starts and ends on the live control and not on
+        // where it stood when the menu opened (`Menu::track_opener`).
+        let page_opener = page_lift.zip(lift_parts.as_ref()).and_then(|((entry, focus), lift_parts)| {
+            let key = focus?;
+            let host = self.nav.tabs.stack.top().filter(|e| e.id == entry)?.inst.as_ref()?;
+            let Split { views, measure, .. } = rig.split();
+            let cx = lift_parts.page_cx::<H>(views, measure, entry, lift_parts.focus.clone(), self.nav.tabs.stack.beneath_id(entry));
+            Some((key, Focusable::<H>::place(&*host.screen, &key.elem, &cx, At::Drawn)?.rect))
+        });
+        if let Some((key, rect)) = page_opener {
+            for s in &mut self.nav.modals.surfaces {
+                if let Some(inst) = s.entry.inst.as_mut().filter(|i| i.screen.opener().is_some_and(|(entry, opener)| entry == key.entry && opener == Some(key))) {
+                    inst.screen.opener_rect(rect);
+                }
+            }
+        }
         let (_, host_render) = self.nav.modals.host_policy();
         // §9: armed for the LENGTH OF THE DRAW, and restored rather than cleared, exactly as the
         // page freeze is. Every framebuffer-sampling door is refused while it is up.
@@ -2581,8 +2642,7 @@ where
                     }
                     set.pages += 1;
                     set.bytes += inst.screen.render_report().bytes;
-                    if Z::CHROME < ceiling && top_entry == Some(e.id) && e.arg.chrome() == plx_machine::machine::Chrome::TabBar
-                        && inst.screen.focus_source() == FocusSource::Engine {
+                    if Z::CHROME < ceiling && top_entry == Some(e.id) && wears_bar::<H>(&e.arg, &*inst.screen) {
                         let mut chrome_parts = parts.clone();
                         chrome_parts.owner = InputOwner::Entry(e.id);
                         chrome_parts.focus = input.engine.read(chrome_parts.owner);
@@ -2607,10 +2667,10 @@ where
             // The strip is the container's control, not a page-local pointer ladder: its stops go
             // above the page and below surfaces, from the same keyed geometry the engine queries.
             stops.extend(Self::bar_stops(nav, strip_owner, navigation));
-            // **The surfaces' modal dim, last thing in the page pass** (§6.2, §8.3). It is here
+            // **Page-backed modal dims, last thing in the page pass** (§6.2, §8.3). They go here
             // and not with each panel because the dim has to be on the framebuffer BEFORE any
             // surface's glass grabs its backdrop — see `ModalStack::draw_scrims`, which owns the
-            // rule and the one style it does not apply to. `surface_scope` is the freeze lift the
+            // page-backed rule. `surface_scope` is the freeze lift the
             // paint needs: a page served from its cached quad refuses every fill, and this is the
             // frame's first `popover::host::live()`, which is also what defines the host snapshot
             // as the UNDIMMED page — and the instant the dims' inherited field is read from
@@ -2634,18 +2694,36 @@ where
         if host_render == HostRender::Cached {
             set.frame_cache_bytes = set.frame_cache_bytes.max(super::frame::FRAME_CACHE_BYTES);
         }
-        // the surfaces, bottom to top; a later stop is above an earlier one. Each is handed the
-        // stack's ONE underlay field — brought up to date by the dims above (from the undimmed
-        // page, or the playing item's envelope, which may be the one kept from an earlier open or
-        // preloaded ahead of it) — which is what a popover panel's ground is drawn from
-        // (`widgets::panel_ground`). Disjoint fields of the stack: the field is only read here.
+        // Draw surfaces bottom to top. Page-backed panels read the stack's latched underlay
+        // for their ground. Panels above an opaque surface use a neutral field and paint their
+        // dim over the opaque host immediately before drawing the panel.
         let modals = &mut nav.modals;
-        let field = modals.underlay.field();
+        use super::containers::modal::{DimSink, GlDims};
+        let opaque = modals.first_opaque();
         let (mut drain_surface_text, mut capture_surface) = (false, false);
         for (index, s) in modals.surfaces.iter_mut().enumerate() {
             let z = Z::surface(index);
-            if z >= ceiling { break; }
+            let scrim_z = Self::surface_scrim_z(index);
+            let over_opaque = opaque.is_some_and(|opaque| index > opaque);
+            if (if over_opaque { scrim_z } else { z }) >= ceiling { break; }
             if s.faded() { continue; }
+            let field = if over_opaque {
+                let flat = modals.underlay.flat_field();
+                // The frozen page does not include the opaque host. Use the shared flat ink
+                // and composite it here so it covers that host without dimming the popup.
+                let alpha = s.scrim_alpha(navigation.page_alpha);
+                if alpha > 0.0 {
+                    let _dim_layer = backdrop::layer(scrim_z, false);
+                    let _scope = rig.surface_scope();
+                    backdrop::draw_span("scrims", || {
+                        crate::popover_glass::dim_owner(index, || GlDims::new(present).dim(flat, alpha));
+                    });
+                }
+                flat
+            } else {
+                modals.underlay.field()
+            };
+            if z >= ceiling { break; }
             let _layer = backdrop::layer(z, false);
             if let Some(inst) = s.entry.inst.as_mut() {
                 let _surface_scope = rig.surface_scope();

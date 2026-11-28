@@ -86,6 +86,14 @@ pub enum Activation<A, Dest> {
     Action(A),
 }
 
+/// What a re-typed row keeps of its binding ([`Form::map`]): the focus key and the kind and action in the new
+/// alphabet. Its identity is the one `map`'s `id` answered, and `disabled` carries over.
+pub struct Rebind<A, Dest> {
+    pub key: RowKey,
+    pub kind: RowKind<Dest>,
+    pub action: A,
+}
+
 /// A focusable row's non-visual half, kept parallel to the table by [`FormTable`] alone.
 #[derive(Clone, Debug)]
 pub struct Binding<Id, A, Dest> {
@@ -188,6 +196,21 @@ impl<Id, A, Dest> FormSection<Id, A, Dest> {
         }
         self
     }
+    /// Make the item just declared **INERT** when `cond` holds: it stays in the table, drawn dimmed
+    /// ([`Row::inert`]), but it becomes an inert slot - no binding, no key, no accessibility name -
+    /// so focus travel skips it in both directions and nothing can activate it. Where
+    /// [`Self::disabled`] keeps the row focusable so the viewer can read why it does nothing, this is
+    /// for an action that does not exist right now and has no reason worth a stop of focus (Library
+    /// order's Reset row while the order is the server's own). Like [`Self::disabled`] it is a no-op
+    /// when the last slot is not an item, or the last declaration was an `_if` that was skipped.
+    pub fn inert(mut self, cond: bool) -> Self {
+        if cond && !self.skipped && matches!(self.slots.last(), Some(Slot::Item(..))) {
+            if let Some(Slot::Item(_, row, _)) = self.slots.pop() {
+                self.push(Slot::Inert(row.inert(true)));
+            }
+        }
+        self
+    }
     pub fn item_keyed_if(
         mut self,
         cond: bool,
@@ -243,6 +266,9 @@ impl<Id: FormId, A, Dest> FormSection<Id, A, Dest> {
 /// An ordered list of sections, built by a PURE function of plain inputs.
 pub struct Form<Id, A, Dest> {
     sections: Vec<FormSection<Id, A, Dest>>,
+    /// Rows that have changed shape since a page above this one was opened from them: `(was, is)`
+    /// ([`Self::alias`]).
+    aliases: Vec<(Id, Id)>,
 }
 impl<Id, A, Dest> Default for Form<Id, A, Dest> {
     fn default() -> Self {
@@ -253,16 +279,33 @@ impl<Id, A, Dest> Form<Id, A, Dest> {
     pub fn new() -> Self {
         Self {
             sections: Vec::new(),
+            aliases: Vec::new(),
         }
     }
     pub fn section(mut self, s: FormSection<Id, A, Dest>) -> Self {
         self.sections.push(s);
         self
     }
+    /// **Say that the row `is` now stands for the row `was`**: a row can change shape under a viewer while a page
+    /// above it is open (a language that dropped to one track is a direct row now, and the reverse), and the page
+    /// above remembers the row it was opened from by its identity. A pop that lands on this form seats the cursor on
+    /// `is` where it would have sought `was` ([`Self::stands_for`]).
+    pub fn alias(mut self, was: Id, is: Id) -> Self {
+        self.aliases.push((was, is));
+        self
+    }
+    /// The row of this form that stands for the row `id` NOW: what [`Self::alias`] said, else `id` itself.
+    pub fn stands_for(&self, id: &Id) -> Id
+    where
+        Id: PartialEq + Clone,
+    {
+        self.aliases.iter().find(|(was, _)| was == id).map_or_else(|| id.clone(), |(_, is)| is.clone())
+    }
     /// `other`'s sections after this form's own: a page that embeds a list built elsewhere (the
     /// Library's Sort & Filter menu holds the Sources list) keeps that list's sections whole.
     pub fn then(mut self, other: Self) -> Self {
         self.sections.extend(other.sections);
+        self.aliases.extend(other.aliases);
         self
     }
     /// Does the built form hold a focusable row `id` (in a visible section)? What a rebuild asks
@@ -291,12 +334,22 @@ impl<Id, A, Dest> Form<Id, A, Dest> {
             })
             .collect()
     }
-    /// Re-type every focusable row: `f` gets each binding and answers its replacement, or `None` to
-    /// demote the row to an inert slot — still DRAWN exactly as declared, but never focusable.
-    /// Sections, headers, accessories and every row's presentation pass through untouched, so a
-    /// shared builder (`appkit::source_list::form`) serves a surface that has its own row identities.
-    pub fn map<Id2, A2>(self, mut f: impl FnMut(Binding<Id, A, Dest>) -> Option<Binding<Id2, A2, Dest>>) -> Form<Id2, A2, Dest> {
+    /// **Re-type the form**: the ONE way a form moves to another row alphabet. `id` names each row's identity in
+    /// the new alphabet, once (`None` demotes the row to an inert slot: still DRAWN exactly as declared, never
+    /// focusable); `row` then gets the old identity, the new one, and the row's kind and action, and answers the new
+    /// [`Rebind`] (key, kind, action). The form's aliases ([`Self::alias`]) go through the same `id`, so what a
+    /// page declares about a pop survives the re-typing, and an alias naming a row `id` refuses is dropped. A
+    /// `disabled` row stays disabled. Sections, headers, accessories and every row's presentation pass through
+    /// untouched, so a shared builder (`appkit::source_list::form`, `appkit::track_rows`) serves a surface that has
+    /// its own row identities.
+    pub fn map<Id2, A2, Dest2>(
+        self,
+        mut id: impl FnMut(&Id) -> Option<Id2>,
+        mut row: impl FnMut(&Id, &Id2, RowKind<Dest>, A) -> Rebind<A2, Dest2>,
+    ) -> Form<Id2, A2, Dest2> {
+        let aliases = self.aliases.into_iter().filter_map(|(was, is)| Some((id(&was)?, id(&is)?))).collect();
         Form {
+            aliases,
             sections: self
                 .sections
                 .into_iter()
@@ -308,11 +361,14 @@ impl<Id, A, Dest> Form<Id, A, Dest> {
                         .slots
                         .into_iter()
                         .map(|slot| match slot {
-                            Slot::Item(b, row, name) => match f(b) {
-                                Some(b2) => Slot::Item(b2, row, name),
-                                None => Slot::Inert(row),
+                            Slot::Item(b, row_, name) => match id(&b.id) {
+                                Some(id2) => {
+                                    let Rebind { key, kind, action } = row(&b.id, &id2, b.kind, b.action);
+                                    Slot::Item(Binding { id: id2, key, kind, action, disabled: b.disabled }, row_, name)
+                                }
+                                None => Slot::Inert(row_),
                             },
-                            Slot::Inert(row) => Slot::Inert(row),
+                            Slot::Inert(row_) => Slot::Inert(row_),
                         })
                         .collect(),
                 })
@@ -370,11 +426,29 @@ pub struct FormTable<Id, A, Dest> {
 impl<Id: PartialEq + Clone, A: Clone, Dest: Clone> FormTable<Id, A, Dest> {
     /// `key_ceiling`: every [`RowKey`] must be below it (the page's key band; debug-asserted).
     pub const fn new(key_ceiling: u32) -> Self {
+        Self::with_class(key_ceiling, crate::menu::Class::Picker)
+    }
+
+    /// [`Self::new`] whose table is of the size class `class` says ([`TableView::with_class`]), fixed here.
+    pub const fn with_class(key_ceiling: u32, class: crate::menu::Class) -> Self {
         Self {
-            table: TableView::new(),
+            table: TableView::with_class(class),
             bindings: Vec::new(),
             names: Vec::new(),
             key_ceiling,
+            engine_key: None,
+            reseat: None,
+        }
+    }
+
+    /// **An empty form dressed like this one** ([`TableView::blank_like`]): the same key band and table class, no rows.
+    /// A page that is built to be measured or warmed without being shown ([`crate::menu::Menu::prewarm_aside`]) lives in it.
+    pub fn blank_like(&self) -> Self {
+        Self {
+            table: self.table.blank_like(),
+            bindings: Vec::new(),
+            names: Vec::new(),
+            key_ceiling: self.key_ceiling,
             engine_key: None,
             reseat: None,
         }
@@ -411,6 +485,17 @@ impl<Id: PartialEq + Clone, A: Clone, Dest: Clone> FormTable<Id, A, Dest> {
         self.install_keeping(form, keep, false, false);
     }
 
+    /// [`Self::set_sliding`] for an ACTION MENU rebuilt under the cursor: a `keep` that survives glides (the
+    /// pill and the scroll stay where they are); one that vanished does NOT slide onto its neighbour but opens
+    /// afresh on `initial` (else [`TableView::opening_row`]), as [`Self::open`] does.
+    pub fn set_sliding_or_open(&mut self, form: Form<Id, A, Dest>, keep: Option<&Id>, initial: Option<&Id>) {
+        if keep.is_some_and(|k| form.contains(k)) {
+            self.install_keeping(form, keep, true, false);
+        } else {
+            self.open(form, initial);
+        }
+    }
+
     /// [`Self::set`] for a rebuild that happens UNDER the cursor and must not move the scroll or
     /// the highlight pill — a toggled switch on a list that has scrolled: the pill and the scroll
     /// keep gliding from where they are instead of snapping (`TableView::set_sections`'s `slide`).
@@ -424,13 +509,66 @@ impl<Id: PartialEq + Clone, A: Clone, Dest: Clone> FormTable<Id, A, Dest> {
     fn install_keeping(&mut self, form: Form<Id, A, Dest>, keep: Option<&Id>, slide: bool, neighbour: bool) {
         let (sections, bindings, names) = self.check(form);
         let landing = keep.and_then(|k| self.landing_for(k, &bindings, neighbour));
+        let before = self.drawn_keys();
+        let lift = self.lift_key();
         self.bindings = bindings;
         self.names = names;
         match landing {
             Some(i) => self.table.set_sections(sections, i as i32, slide),
             None => self.table.open_sections(sections),
         }
+        self.glide_reordered(&before);
+        self.follow_lift(lift);
         self.reseat_after_install();
+    }
+
+    /// The key of the row the table's lift belongs to (held, or landing after a drop): the identity a
+    /// reinstall follows it by ([`Self::follow_lift`]).
+    fn lift_key(&self) -> Option<RowKey> {
+        let at = usize::try_from(self.table.lift_owner()?).ok()?;
+        self.bindings.get(at)?.as_ref().map(|b| b.key)
+    }
+
+    /// **Hand the lift to the row that was lifted**, by key, wherever the install put it; with no such
+    /// row (it left the form, or the page was opened afresh) the lift is dropped, never left on the
+    /// row that stands in its old slot.
+    fn follow_lift(&mut self, key: Option<RowKey>) {
+        let to = key.and_then(|key| self.index_of_key(key)).map(|i| i as i32);
+        self.table.carry_lift(to);
+    }
+
+    /// Each keyed row's key and where the table DRAWS it now, by global row index (`None` at an
+    /// inert slot): the "before" of a reorder, captured ahead of a reinstall.
+    fn drawn_keys(&self) -> Vec<Option<(RowKey, f32)>> {
+        let tops = self.table.drawn_tops();
+        self.bindings.iter().zip(tops).map(|(b, top)| b.as_ref().map(|b| (b.key, top))).collect()
+    }
+
+    /// **Glide the rows a reinstall REORDERED**: the keyed rows that stand in both `before` and the
+    /// form just installed, compared by key. When their relative order is unchanged (a row appeared
+    /// or went, a value changed) nothing glides and every existing caller cuts exactly as it did;
+    /// when it changed, every surviving row slides from where it was drawn to its new slot
+    /// ([`TableView::glide_from`]). The page decides the order; this only reads it.
+    fn glide_reordered(&mut self, before: &[Option<(RowKey, f32)>]) {
+        let from: Vec<Option<(usize, f32)>> = self
+            .bindings
+            .iter()
+            .map(|b| {
+                let key = b.as_ref()?.key;
+                before.iter().position(|o| o.is_some_and(|(k, _)| k == key)).map(|j| (j, before[j].map_or(0.0, |(_, top)| top)))
+            })
+            .collect();
+        let mut seen = from.iter().flatten().map(|(j, _)| *j);
+        let mut last = None;
+        let reordered = seen.any(|j| {
+            let out = last.is_some_and(|l| j < l);
+            last = Some(j);
+            out
+        });
+        if reordered {
+            let tops: Vec<Option<f32>> = from.iter().map(|f| f.map(|(_, top)| top)).collect();
+            self.table.glide_from(&tops);
+        }
     }
 
     /// **Open** a page: snap the pill, scroll to the top and focus `initial` when the form has it,
@@ -446,6 +584,7 @@ impl<Id: PartialEq + Clone, A: Clone, Dest: Clone> FormTable<Id, A, Dest> {
             Some(i) => self.table.set_sections(sections, i as i32, false),
             None => self.table.open_sections(sections),
         }
+        self.follow_lift(None);
         self.reseat_after_install();
     }
 
@@ -465,6 +604,8 @@ impl<Id: PartialEq + Clone, A: Clone, Dest: Clone> FormTable<Id, A, Dest> {
     pub fn refresh_with(&mut self, form: Form<Id, A, Dest>, prefer: Option<&Id>, fallback: Option<&Id>) {
         let (sections, bindings, names) = self.check(form);
         let find = |id: &Id| Self::position_of(&bindings, id);
+        let before = self.drawn_keys();
+        let lift = self.lift_key();
         let keep = self.selected_id().cloned();
         let landing = prefer
             .and_then(find)
@@ -474,6 +615,8 @@ impl<Id: PartialEq + Clone, A: Clone, Dest: Clone> FormTable<Id, A, Dest> {
         self.bindings = bindings;
         self.names = names;
         self.table.set_sections_or_open(sections, landing.map(|i| i as i32), true);
+        self.glide_reordered(&before);
+        self.follow_lift(lift);
         self.reseat_after_install();
     }
 
@@ -486,6 +629,7 @@ impl<Id: PartialEq + Clone, A: Clone, Dest: Clone> FormTable<Id, A, Dest> {
         self.bindings = bindings;
         self.names = names;
         self.table.restore_sections(sections, at.map(|i| i as i32), scroll);
+        self.follow_lift(None);
         self.reseat_after_install();
     }
 
@@ -564,6 +708,12 @@ impl<Id: PartialEq + Clone, A: Clone, Dest: Clone> FormTable<Id, A, Dest> {
         self.bindings
             .iter()
             .position(|b| b.as_ref().is_some_and(|b| b.key == key))
+    }
+    /// Can focus land on the row `key` names right now? It is bound AND a stop of the table
+    /// ([`Row::selectable`](crate::table::Row::selectable): a row that waits while another is held is
+    /// bound but no stop). `false` for a key the form does not know.
+    pub fn lands_on(&self, key: RowKey) -> bool {
+        self.index_of_key(key).and_then(|i| crate::geom::table_row(&self.table, i)).is_some_and(|row| row.selectable())
     }
     /// The id under the table's current selection.
     pub fn selected_id(&self) -> Option<&Id> {

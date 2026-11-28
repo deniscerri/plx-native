@@ -16,7 +16,7 @@
 //! HTTP, deadline and transport causes for route policy.
 use super::client::{Client, JsonDeadlineOutcome, QueryBuilder, StreamUrl};
 use super::models::MediaContainer;
-use super::params::{Ceiling, TranscodeDelivery, TranscodeSpec};
+use super::params::{Ceiling, TranscodeDelivery, TranscodeSource, TranscodeSpec};
 use super::probe::Location;
 
 // `DP_AUDIO_CODECS` — the AUDIO codec set the buffer-feed pipeline decodes — is defined in
@@ -26,9 +26,10 @@ use super::probe::Location;
 // bounds and sample rate, shared with the device profile.
 pub use plx_os::devcaps::DP_AUDIO_CODECS;
 
-/// Codec, channel and rate check for an actual selected track, against the capability value `caps`
-/// of the attempt asking. Codec-only membership is insufficient on devices whose DTS decoder stops
-/// at 5.1 or whose AAC decoder stops at stereo, on the PCM path, which can name only some rates,
+/// Codec, channel and rate check for an actual selected track the app's own demuxer will be fed
+/// direct, against the capability value `caps` of the attempt asking (a DTS track is judged by the
+/// core it is fed as, `Caps::audio_supports`). Codec-only membership is insufficient on devices
+/// whose DTS row stops below the 5.1 core or whose AAC decoder stops at stereo, on the PCM path, which can name only some rates,
 /// and for a source above the rate ceiling the profile asks the server for (the app-decoded lossless
 /// codecs have none: the app resamples a faster track, `devcaps::pcm_load_rate`). The rate half is
 /// `devcaps::audio_track_fits` (see `devcaps::AUDIO_RATE_CEILING`, #951).
@@ -37,6 +38,15 @@ pub use plx_os::devcaps::DP_AUDIO_CODECS;
 /// server is sent ([`TranscodeSpec::caps`]) and the plan that chose the track come from the same one.
 pub fn is_dp_audio_track_with(caps: &plx_os::devcaps::Caps, codec: &str, channels: i64, sample_rate: i64) -> bool {
     caps.audio_supports(codec, channels) && plx_os::devcaps::audio_track_fits(codec, channels, sample_rate)
+}
+
+/// [`is_dp_audio_track_with`] as an ENCODER SESSION's profile ([`profile_for_delivery`]) states it:
+/// that profile keeps a DTS row's bound on the track's own layout (`Caps::audio_layout_supports`),
+/// so the server converts a 7.1 DTS-HD MA on a `DTS/6` set even though the direct-play ask would
+/// admit it (#1537). A guess at what a session copies (`remux_output_acodec`, `classify_outcome`)
+/// reads this, never the direct-play predicate.
+pub fn is_session_audio_track_with(caps: &plx_os::devcaps::Caps, codec: &str, channels: i64, sample_rate: i64) -> bool {
+    caps.audio_layout_supports(codec, channels) && plx_os::devcaps::audio_track_fits(codec, channels, sample_rate)
 }
 
 /// Subtitle codecs Original client-renders (`ff.rs` / the track menu). This is the
@@ -220,6 +230,15 @@ pub fn direct_play_video_codecs(caps: &plx_os::devcaps::Caps) -> Vec<&'static st
 /// The Load payload cannot drift whatever PMS chooses: `route.rs` reads the OUTPUT codecs off
 /// the /decision response (`decision_codecs`) and describes those, not the profile's wish.
 fn profile_for_delivery(caps: &plx_os::devcaps::Caps, delivery: TranscodeDelivery) -> String {
+    profile_with(caps, delivery, false)
+}
+
+/// [`profile_for_delivery`], with `dts_fed_as_core` saying whether a DTS track the server leaves alone
+/// reaches the app's own demuxer, which feeds its core: then a DTS row that holds the core admits every
+/// DTS-family width ([`plx_os::devcaps::profile_audio_channels`], #1537). Only the direct-play ask
+/// says so ([`profile_for`]): an encoder session's output may go to the TV's own player (the URI
+/// backend's server legs), which reads a copied DTS-HD stream whole, so it keeps the row as it is.
+fn profile_with(caps: &plx_os::devcaps::Caps, delivery: TranscodeDelivery, dts_fed_as_core: bool) -> String {
     let dp_video = direct_play_video_codecs(caps).join(",");
     // The table-gated copy codecs, in list order. Each one is advertised only when the table
     // carries ITS row, and each brings the row's own bound (see `row_limits`).
@@ -299,7 +318,10 @@ fn profile_for_delivery(caps: &plx_os::devcaps::Caps, delivery: TranscodeDeliver
     );
     let audio_limits = caps.audio_channels.iter()
         .filter(|(codec, _)| caps.audio_has(codec))
-        .map(|(codec, channels)| audio_limit(profile_codec_name(codec), "audio.channels", *channels))
+        .map(|(codec, channels)| {
+            let bound = if dts_fed_as_core { plx_os::devcaps::profile_audio_channels(codec, *channels) } else { *channels };
+            audio_limit(profile_codec_name(codec), "audio.channels", bound)
+        })
         .collect::<String>();
     // The rate ceiling (`devcaps::AUDIO_RATE_CEILING`, #951) goes on every codec of the transcode
     // target list and every lossy app-decoded row that `devcaps::audio_rate_bounded` names, the same
@@ -343,8 +365,10 @@ fn profile_for_delivery(caps: &plx_os::devcaps::Caps, delivery: TranscodeDeliver
     )
 }
 
+/// The profile of the direct-play ask ([`Client::mde_decision`]): only the Feed backend direct-plays
+/// what it admits, so a DTS track is fed as its core ([`profile_with`]).
 fn profile_for(caps: &plx_os::devcaps::Caps) -> String {
-    profile_for_delivery(caps, TranscodeDelivery::ProgressiveMkv)
+    profile_with(caps, TranscodeDelivery::ProgressiveMkv, true)
 }
 
 /// The forced-direct-play profile: the engine's own formats, no device limits, no transcode
@@ -431,8 +455,12 @@ impl Client {
         );
         let copy_ok = !hls && !(s.contract.no_video_copy && !s.contract.remux);
         let protocol = if hls { "hls" } else { "http" };
+        let path = match s.source {
+            TranscodeSource::Library(rating_key) => format!("/library/metadata/{rating_key}"),
+            TranscodeSource::Live(key) => key.to_owned(),
+        };
         let mut q = QueryBuilder::new("")
-            .str("path", &format!("/library/metadata/{}", s.rating_key))
+            .str("path", &path)
             .int("mediaIndex", s.media_index as i64)
             .int("partIndex", 0)
             .str("protocol", protocol)
@@ -658,21 +686,39 @@ impl Client {
 
     /// GET /video/:/transcode/universal/stop — free both the physical encoder and the Streaming
     /// Resource bandwidth allocation owned by `session`.
-    /// Returns whether the request reached the server and came back accepted.
+    /// Returns whether the server answered 2xx.
     ///
-    /// Reported rather than discarded, for the reason [`Client::get_ok`] exists: this is a
-    /// body-less WRITE whose caller is off the main thread (`route::scrobble_stop`'s worker), and
-    /// the bool is the only thing that can say it landed. What a silently lost stop leaves behind is
-    /// specific — the server keeps ENCODING into a session nothing will read again, the leaked
-    /// server-side encoder `docs/parity-gaps.md` names on the retranscode path. Like
-    /// [`super::library::Client::scrobble`], it does not tell a 200 from a 404: `get_ok` is
-    /// `http_get`'s own success, which is the honest limit of a GET whose body carries nothing.
+    /// Reported rather than discarded: this is a body-less WRITE whose caller is off the main
+    /// thread (`route::scrobble_stop`'s worker), and the bool is the only thing that can say it
+    /// landed. What a silently lost stop leaves behind is specific — the server keeps ENCODING into
+    /// a session nothing will read again, the leaked server-side encoder `docs/parity-gaps.md`
+    /// names on the retranscode path. A 404 means no transcoder ever ran under `session` (it only
+    /// reached `/decision`): the stop's own close never reaches the Streaming Resource that
+    /// decision reserved, so it is closed through [`Client::transcode_resource_reconciled`], and
+    /// the stop still returns `false`.
     #[track_caller]
     pub fn transcode_stop(&self, session: &str) -> bool {
         if session.is_empty() {
             return false;
         }
-        self.get_ok(&self.transcode_stop_query(session, true))
+        let status = self.get_status(&self.transcode_stop_query(session, true));
+        plx_base::eventlog::log(&format!(
+            "transcode stop status={}",
+            status.map_or_else(|| "none".to_owned(), |s| s.to_string())
+        ));
+        match status {
+            Some(200..=299) => true,
+            // No transcoder under this id: it only ever ran /decision. Its Streaming Resource holds
+            // a stream slot the stop's own close never reached: close it directly, or the server
+            // holds it until its own timeout. Any other refusal may leave an encoder running, and
+            // its resource is the encoder cleanup ledger's to close once `/ping` shows it gone.
+            Some(404) => {
+                let closed = self.transcode_resource_reconciled(session);
+                plx_base::eventlog::log(&format!("transcode resource close ok={}", closed.is_some() as i32));
+                false
+            }
+            _ => false,
+        }
     }
 
     /// Stop the physical encoder while deliberately preserving its Streaming Resource. Runtime
@@ -744,7 +790,7 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::{
-        link_policy, Ceiling, Client, LinkPolicy, Location, TranscodeDelivery, TranscodeSpec,
+        link_policy, Ceiling, Client, LinkPolicy, Location, TranscodeDelivery, TranscodeSource, TranscodeSpec,
     };
     use plx_os::devcaps::Caps;
     use crate::plex::{AudioEnhancements, EncodeContract, Origin, ServerId};
@@ -778,7 +824,7 @@ mod tests {
         audio: AudioEnhancements,
     ) -> TranscodeSpec<'a> {
         TranscodeSpec {
-            rating_key: "5",
+            source: TranscodeSource::Library("5"),
             media_index: 0,
             session: "s1",
             encoder_session: "s1",
@@ -797,29 +843,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_live_session_is_not_prefixed_with_library_metadata() {
+        let mut live = spec(false, false);
+        live.source = TranscodeSource::Live("/livetv/sessions/9b9fe727-0000-46db-b94c-ef512e3e61d2");
+        let query = a_client().transcode_query(&live);
+        assert!(query.contains("path=%2Flivetv%2Fsessions%2F9b9fe727-0000-46db-b94c-ef512e3e61d2&"), "{query}");
+        assert_eq!(query.replace("path=%2Flivetv%2Fsessions%2F9b9fe727-0000-46db-b94c-ef512e3e61d2&", "path=%2Flibrary%2Fmetadata%2F5&"),
+            a_client().transcode_query(&spec(false, false)), "the source changes no encode contract parameter");
+    }
+
     /// PMS acknowledges `/stop` before its cleanup worker erases the physical session. The
     /// matching ping exact-looks up that half of the lifecycle: 200 while the physical map entry
     /// exists, 404 after it is gone. Other statuses prove neither state and must fail closed; the
     /// logical Streaming Resource has its own close method and is deliberately not inferred here.
     //
-    // Dev-only, this test through `resource_close_is_posted_and_accepts_only_terminated_or_absent`
-    // below: each drives a plaintext loopback PMS with a real, token-bearing client, which a store
-    // build's `CredentialPolicy::HttpsOnly` refuses before the request reaches the wire (see
-    // `http::credential_transport_allowed`) — the refused call's return value fails the fixture's
-    // own assertion. The store-build case is covered instead by `auth.rs`'s `e2e_real_curl_*`
-    // HTTPS harness.
+    /// A plaintext loopback PMS that answers one connection per entry of `statuses`, in order,
+    /// with an empty body, publishing each request line; and a client pointed at it.
     #[cfg(feature = "devtriggers")]
-    #[test]
-    fn transcode_ping_distinguishes_present_absent_and_unknown_cleanup_state() {
-        use std::io::{BufRead, BufReader, Write};
+    fn loopback_pms(
+        statuses: &'static [&'static str],
+    ) -> (
+        Client,
+        std::sync::mpsc::Receiver<String>,
+        std::thread::JoinHandle<()>,
+    ) {
         use plx_base::testnet::{self, CLIENT_WAIT};
+        use std::io::{BufRead, BufReader, Write};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().unwrap().port() as i32;
         let (tx, rx) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
-            for status in ["200 OK", "404 Not Found", "500 Internal Server Error"] {
-                let (mut socket, _) = testnet::accept_within(&listener, CLIENT_WAIT).expect("accept ping");
+            for status in statuses {
+                let (mut socket, _) =
+                    testnet::accept_within(&listener, CLIENT_WAIT).expect("accept");
                 let mut line = String::new();
                 BufReader::new(&socket)
                     .read_line(&mut line)
@@ -832,7 +890,6 @@ mod tests {
                 .expect("response");
             }
         });
-
         let client = Client::new(
             ServerId::from_raw(1),
             "mach",
@@ -840,6 +897,20 @@ mod tests {
             "tok",
             "cid",
         );
+        (client, rx, server)
+    }
+
+    // Dev-only, this test through `resource_close_is_posted_and_accepts_only_terminated_or_absent`
+    // below: each drives a plaintext loopback PMS with a real, token-bearing client, which a store
+    // build's `CredentialPolicy::HttpsOnly` refuses before the request reaches the wire (see
+    // `http::credential_transport_allowed`) — the refused call's return value fails the fixture's
+    // own assertion. The store-build case is covered instead by `auth.rs`'s `e2e_real_curl_*`
+    // HTTPS harness.
+    #[cfg(feature = "devtriggers")]
+    #[test]
+    fn transcode_ping_distinguishes_present_absent_and_unknown_cleanup_state() {
+        let (client, rx, server) =
+            loopback_pms(&["200 OK", "404 Not Found", "500 Internal Server Error"]);
         assert_eq!(client.transcode_session_present("encoder-one"), Some(true));
         assert_eq!(client.transcode_session_present("encoder-two"), Some(false));
         assert_eq!(client.transcode_session_present("encoder-three"), None);
@@ -904,35 +975,8 @@ mod tests {
     #[cfg(feature = "devtriggers")]
     #[test]
     fn resource_close_is_posted_and_accepts_only_terminated_or_absent() {
-        use std::io::{BufRead, BufReader, Write};
-        use plx_base::testnet::{self, CLIENT_WAIT};
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().unwrap().port() as i32;
-        let (tx, rx) = std::sync::mpsc::channel();
-        let server = std::thread::spawn(move || {
-            for status in ["200 OK", "404 Not Found", "500 Internal Server Error"] {
-                let (mut socket, _) = testnet::accept_within(&listener, CLIENT_WAIT).expect("accept close");
-                let mut line = String::new();
-                BufReader::new(&socket)
-                    .read_line(&mut line)
-                    .expect("request line");
-                tx.send(line).expect("publish request");
-                write!(
-                    socket,
-                    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .expect("response");
-            }
-        });
-
-        let client = Client::new(
-            ServerId::from_raw(1),
-            "mach",
-            Origin::http("127.0.0.1", port),
-            "tok",
-            "cid",
-        );
+        let (client, rx, server) =
+            loopback_pms(&["200 OK", "404 Not Found", "500 Internal Server Error"]);
         assert_eq!(
             client.transcode_resource_reconciled("resource-one"),
             Some(true)
@@ -951,6 +995,30 @@ mod tests {
                 "{line}",
             );
         }
+        server.join().unwrap();
+    }
+
+    /// A session that only ever ran `/decision` has no transcoder: PMS answers its `/stop` 404
+    /// and its Streaming Resource, which holds a stream slot, is left to the server's timeout. The
+    /// stop must then close the resource itself, or two quick start/stop cycles exhaust a
+    /// server's stream limit.
+    // Dev-only: see the comment on `transcode_ping_distinguishes_present_absent_and_unknown_cleanup_state`.
+    #[cfg(feature = "devtriggers")]
+    #[test]
+    fn a_stop_that_finds_no_transcoder_still_closes_the_reserved_resource() {
+        let (client, rx, server) = loopback_pms(&["404 Not Found", "200 OK"]);
+        assert!(!client.transcode_stop("decided-only"));
+        let stop = rx.recv().expect("stop request");
+        assert!(
+            stop.starts_with("GET /video/:/transcode/universal/stop?"),
+            "{stop}"
+        );
+        let close = rx.recv().expect("the resource close after a 404 stop");
+        assert!(close.starts_with("POST /status/sessions/close?"), "{close}");
+        assert!(
+            close.contains("X-Plex-Session-Identifier=decided-only"),
+            "{close}"
+        );
         server.join().unwrap();
     }
 
@@ -1357,9 +1425,29 @@ mod tests {
         // transcode target and the channel limitation's scopeName. `dts` appears nowhere.
         assert!(list_of(&profile, "audioCodec=").contains(&"dca".into()));
         assert!(list_of(target_of(&profile), "audioCodec=").contains(&"dca".into()));
-        assert!(profile.contains("scope=videoAudioCodec&scopeName=dca&type=upperBound&name=audio.channels&value=6&replace=true"));
+        assert!(profile.contains("scope=videoAudioCodec&scopeName=dca&type=upperBound&name=audio.channels&value=8&replace=true"));
         assert!(!profile.contains("dts"), "{profile}");
         assert!(!profile.contains("truehd"));
+    }
+
+    /// #1537: a DTS row that holds the 5.1 core lets PMS direct-play a 7.1 DTS-HD MA (the pipeline
+    /// feeds its core), so the direct-play ask's `dca` bound is the widest DTS-HD layout, not the row's
+    /// 6. An encoder session, and a row narrower than the core (a learned stereo ceiling), state the
+    /// row as it is.
+    #[test]
+    fn a_dts_row_that_holds_the_core_lets_the_server_direct_play_7_1_dts_hd() {
+        let bound = |n: u32| format!("scope=videoAudioCodec&scopeName=dca&type=upperBound&name=audio.channels&value={n}&replace=true");
+        let mut caps = Caps::assumed();
+        caps.audio.push_str(",dts");
+        caps.audio_channels.insert("dts".into(), 6);
+        let profile = super::profile_for(&caps);
+        assert!(profile.contains(&bound(8)) && !profile.contains(&bound(6)), "{profile}");
+        // An encoder session's output may reach the TV's own player whole: it keeps the row's 6.
+        let session = super::profile_for_delivery(&caps, super::TranscodeDelivery::ProgressiveMkv);
+        assert!(session.contains(&bound(6)) && !session.contains(&bound(8)), "{session}");
+        caps.audio_channels.insert("dts".into(), 2);
+        let profile = super::profile_for(&caps);
+        assert!(profile.contains(&bound(2)) && !profile.contains(&bound(8)), "{profile}");
     }
 
     /// FLAC is decoded in the app and fed as PCM: offered for direct play (and Force) on a set

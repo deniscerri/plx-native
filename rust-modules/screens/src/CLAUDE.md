@@ -114,7 +114,12 @@ that mixes async content with a live cursor:
   Before the item lands, and in the landing frame before `reconcile` has moved focus off the toggle,
   only a focus move ends it: an OK there would let its press commit on the watched toggle, so an OK,
   a key that moves nothing, a wheel, a drag and a hover on the control already focused leave it the
-  page's.
+  page's. **A fetch that settles with no item is its own page** (`DetailSlot::Failed`,
+  `detail/failed.rs`): the page-placed `Failed` read-out with *Try again*, the hero row not drawn and
+  none of its controls valid, so `reconcile` answers *Try again* before it asks `provisional` anything
+  and an OK that reaches a hero control in the frame the failure landed on presses nothing. *Try again*
+  re-sends the page's `RequestDetail` and re-arms `provisional` as a fresh open does, so the retry's
+  landing does not leave focus on the watched toggle either.
 - **The grid absorbs an index landing, the page shifts its scroll.** The Library's grid is a
   `cards::Grid` in `ScrollMode::External`: when the focused element's index changes with no
   `FocusMoved` (an insert or reorder before it) the grid moves its pop with the element and
@@ -205,10 +210,10 @@ smallest worked example.
   `revision` (a counter that moves whenever anything the sections read moves), `sections` (the
   `SectionSpec`s, in order), `fallback` (the order focus falls back through when a section empties)
   and `cards` (a section's `CardSource`, `None` while it has no content). Optional hooks: `pending`,
-  `recover`, `card_has_menu`, `elem_of`, `plain_len`, `plain_elem`, `plain_step`, `focus_rect`,
-  `element_rect`, `seat_override`, `reveal_margin`, `shelf_foot`, `wide_extent`, `plain_group`,
+  `recover`, `card_has_menu`, `elem_of`, `plain_len`, `plain_elem`, `plain_name`, `plain_a11y`, `plain_step`, `focus_rect`,
+  `element_rect`, `seat_override`, `reveal_margin`, `shelf_foot`, `shelf_foot_open`, `reveal_foot`, `wide_extent`, `plain_group`,
   `reveal_with`, `draw_heading`, `custom_draw`. Stacked shelves are adjacent sections and the air
-  under one is its `shelf_foot` (Search, Person), never a `Custom` gap section between two: a shelf's
+  under one is its `shelf_foot` (Search, Person, Live TV), never a `Custom` gap section between two: a shelf's
   caption stops short of the next shelf's lifted heading, which `Stack` reads off the section that follows.
 - Hold the `Stack` in the screen, feed it every event with `stack.on(&page, ev, cx, fx)` and draw
   through `stack.view(&page)`. Get `Focusable` from `plx_ui::focusable_via_view!`
@@ -237,7 +242,7 @@ Captures are the check — see the `ui-sim` and `which-tier` skills, and `../../
 ## Under posters settings page (library redesign)
 
 `SettingsPage::UnderPosters` (ScreenId 113, `settings_under_posters.rs`) is pushed from Settings >
-Libraries, which now has two rows (Favorite libraries, Under posters). The page has five rows (Title, Movie details ›, TV show details ›, Sort value, Reset), with Reset disabled when all values are at their defaults. Each details row carries its ticked parts on the right (their names joined with " · " in the line's fixed order, "Nothing", or a count such as "4 details" once the joined names pass `NAMES_BUDGET_CHARS`). The page draws the shared picture slot (`RootPicture`, also drawn on the Settings root and on both pickers): one movie poster on the left and one show poster on the right (250 x 375 tiles, 410 apart), each demonstrating the stored selections and each the first poster of its kind (with a poster path) in the WIDEST cache the Browse store holds (`DirectoryView::kind_poster`: the current library's listing and shelves, then every other library's retained rows and shelves), so a last-opened Movies library still shows a real show (a kind the cache has none of is asked for as its library's hubs by `PosterAsk`, from this page and from the Settings root while its Under posters row has focus, until the poster is there or `DirectoryView::kind_shelves_published`); a kind with no art anywhere draws `widgets::absent_card` (the never-sentinel absence ground, uncounted), never `Art::Poster(None)`, which is a skeleton the frame-dump harness refuses; each tile wears its KIND over it ("MOVIE", "TV SHOW": the catalog's `browse.kind.movie` / `browse.kind.tv_show` drawn by `plx_ui::table::draw_caps_label_aligned`, the section header's caps, centred over the tile in `TEXT_READING`), a bold title line above the details line when Title is On, and details in the 380 px preview column, wrapping to two lines if needed. The picker and the picture both use an example for a selected fact the poster lacks. A focused library poster still uses the focused-title marquee (`card_row.rs`); **the column of the kind that is not being chosen is dimmed to the design's `dim`** (`plx_ui::follow_copy::DIM`, 0.45, from `Sv2s-P2-Details`: on the page the kind of the OTHER details row, in a picker the other kind, both at 1 on the root and on Title / Sort value / Reset), caption, tile and lines together as one group on the shared appear spring (`ColumnDims`); it is not the disabled control state. No frame, no clipping and no caption such as "Sorted by Year" or "The library you last opened" (those locale keys were deleted). Each details row pushes `SettingsPage::UnderPostersDetails(PosterKind)` (ScreenId 114, `DetailsPage` in the same file, shared by both kinds), the picker of that kind's details parts: one section, "Show under posters", with a row per part (a movie: Year, Length, Genre, Video quality, Age rating, Score; a show: Year, Seasons, Genre, Age rating, Score), a check mark on the ticked ones and a sample of the part on the right. OK ticks or unticks the row and STAYS on the page (the write goes through `PreferenceCmd::Choose`); at most four are ticked (`DetailParts::MAX`) and with four ticked the unticked rows are DISABLED through the shared `FormSection::disabled` (focusable, inert to OK), their sentence beside the table saying why. The parts are `plx_base::detail_parts::{DetailPart, DetailParts}` (fixed line order, kept to what a kind offers by `for_movies` / `for_shows`); the stored setting keeps the retired single-choice ladder only as the migration source and as the downgrade key (`UnderPostersLadder`). The caption band stays shut only when Title is Off and BOTH part sets are empty (`CaptionPolicy::show_details` is the show's own set). `settings::caption_policy_of`
+Libraries (`root_form`'s `libraries` section declares its rows). The page has five rows (Title, Movie details ›, TV show details ›, Sort value, Reset), with Reset disabled when all values are at their defaults. Each details row carries its ticked parts on the right (their names joined with " · " in the line's fixed order, "Nothing", or a count such as "4 details" once the joined names pass `NAMES_BUDGET_CHARS`). The page draws the shared picture slot (`RootPicture`, also drawn on the Settings root and on both pickers): one movie poster on the left and one show poster on the right (250 x 375 tiles, 410 apart), each demonstrating the stored selections and each the first poster of its kind (with a poster path) in the WIDEST cache the Browse store holds (`DirectoryView::kind_poster`: the current library's listing and shelves, then every other library's retained rows and shelves), so a last-opened Movies library still shows a real show (a kind the cache has none of is asked for as its library's hubs by `PosterAsk`, from this page and from the Settings root while its Under posters row has focus, until the poster is there or `DirectoryView::kind_shelves_published`); a kind with no art anywhere draws `widgets::absent_card` (the never-sentinel absence ground, uncounted), never `Art::Poster(None)`, which is a skeleton the frame-dump harness refuses; each tile wears its KIND over it ("MOVIE", "TV SHOW": the catalog's `browse.kind.movie` / `browse.kind.tv_show` drawn by `plx_ui::table::draw_caps_label_aligned`, the section header's caps, centred over the tile in `TEXT_READING`), a bold title line above the details line when Title is On, and details in the 380 px preview column, wrapping to two lines if needed. The picker and the picture both use an example for a selected fact the poster lacks. A focused library poster still uses the focused-title marquee (`card_row.rs`); **the column of the kind that is not being chosen is dimmed to the design's `dim`** (`plx_ui::follow_copy::DIM`, 0.45, from `Sv2s-P2-Details`: on the page the kind of the OTHER details row, in a picker the other kind, both at 1 on the root and on Title / Sort value / Reset), caption, tile and lines together as one group on the shared appear spring (`ColumnDims`); it is not the disabled control state. No frame, no clipping and no caption such as "Sorted by Year" or "The library you last opened" (those locale keys were deleted). Each details row pushes `SettingsPage::UnderPostersDetails(PosterKind)` (ScreenId 114, `DetailsPage` in the same file, shared by both kinds), the picker of that kind's details parts: one section, "Show under posters", with a row per part (a movie: Year, Length, Genre, Video quality, Age rating, Score; a show: Year, Seasons, Genre, Age rating, Score), a check mark on the ticked ones and a sample of the part on the right. OK ticks or unticks the row and STAYS on the page (the write goes through `PreferenceCmd::Choose`); at most four are ticked (`DetailParts::MAX`) and with four ticked the unticked rows are DISABLED through the shared `FormSection::disabled` (focusable, inert to OK), their sentence beside the table saying why. The parts are `plx_base::detail_parts::{DetailPart, DetailParts}` (fixed line order, kept to what a kind offers by `for_movies` / `for_shows`); the stored setting keeps the retired single-choice ladder only as the migration source and as the downgrade key (`UnderPostersLadder`). The caption band stays shut only when Title is Off and BOTH part sets are empty (`CaptionPolicy::show_details` is the show's own set). `settings::caption_policy_of`
 maps the stored `UnderPosters` to the ui `CaptionPolicy`. **EVERY poster tile reads that one policy through
 `registry::captions`** (`policy_for(&ScreenInputs)` from the host's effective frame capture; `TEST_UNDER_POSTERS` is a fixture input only, `label()` the one builder of a focused
 poster's `[title, details]`, `shelf_label()` for Home's and Recommended's shelves): the Library grid, the Collections page, the Watchlist,
@@ -296,7 +301,16 @@ episode view's cards are 4 columns wide, wider than a poster, so no value gains 
 input, not a read:** a screen reads no clock and fetches no date; the application's loop publishes the
 calendar date once per frame (`Bridge::publish_today`, read from the platform at most once a minute through
 `app::clock::today`, the loop its one caller) and `LibraryLike::today` hands it in from the frame's views,
-and `CaptionCache` keys its labels on it so "Today" rebuilds at midnight. The Under posters page's picture
+and `CaptionCache` keys its labels on it so "Today" rebuilds at midnight. **The time of day is the same kind of
+input:** the loop publishes one clock reading per frame, the wall-clock instant and the zone's UTC offset at it
+(`Bridge::publish_clock`, from `app::clock::reading`, whose date and offset are ONE per-minute zone read; the offset
+is absent where the zone cannot be read, and then there is no `Wall`, while the Live TV store still takes its `now` from
+the same instant), a page receives the `Wall` as `LiveTvLike::wall`, the player on `HudModel::wall` (the app's `hud_model` copies the published wall into
+the model it sends, so the screen has no second route to it), and every clock face, "22m left" and progress fraction is derived from them by the pure
+`plx_ui::fmt::airing_line` / `left` / `frac` (each takes the `Wall`, and decides through `plx_ui::fmt::phase`; `None`
+under a replay: no clock face, never a guessed one). **The words are never cached in a published fact:** the player's
+live info keeps the guide's raw begin and end and the HUD words the airing at draw, with the screen's
+`clock_fingerprint` following the airing's phase stamp so a frame is owed when the minute turns. The Under posters page's picture
 illustrates the mode as a library sorted by Year while the Sort value row has focus: each sample's own year
 (through `registry::sort_info::year_value`, the Year sort's own wording) replaces its caption lines (`RootPicture::sorted`; the details pickers never preview it). The picture never adds sort choices.
 
@@ -342,3 +356,115 @@ plan no longer holds is seated on the first band with films (`RailPart::reconcil
   grid's card is in, none when the card is among the items the sort leaves without a value, which lie before the first
   band or after the last) `TEXT_PRIMARY`, and the focused band wears the white focus pill (38 high, built with
   `widgets::focus_pill`, filled as the letters' disc is). There is no position bar or marker.
+
+## The live player: banner, debounced zap, BACK to the channel left (Live TV PR4)
+
+A live channel has **no transport**. `PlayerScreen::hud_drawn` and `hud_up` are `false` on a live session, so the
+scrubber, the control row, Info, Chapters and the track menus are not drawn and cannot be reached; what is drawn is the
+art ground and the banner (`player/live.rs`), and what a key does is `PlayerScreen::live_key`, ahead of the VOD ladder:
+Up, Down, CH+ and CH- step the zap; Left, Right and OK only raise the banner; BACK and STOP leave in ONE press at every phase
+(the debounce, buffering, playing: the VOD transport's hide-first BACK never sees a live channel), and drop a zap still pending so no tune follows the exit; the digits 0-9 open number
+entry (section below); Play/Pause and EXIT fall through to the ladder as before. A failure read-out still owns the frame
+first, as on any playback. VOD input is untouched: every VOD player test passes unmodified.
+
+The decisions are three named phases in `player/zap.rs`, pure, stepped from keys, the Tick and the app's addressed words
+(`Live::press`, `reveal`, `started`, `refused`, `leave`, `cancel_zap`, `jump`, `tick`; no clock read, no session read): **`Zap`** (`Idle`,
+`Pending` while presses are collected, `Tuning` after the ask until the session shows the target's first frame) with a
+600 ms debounce (`DEBOUNCE_MS`) and ONE `PlayerReq::Tune` per run of presses, named by the channel's identity. Its events
+are `Step`, `Jump`, `Tick`, `Session`, `Refused` and `Cancel`, all in the table at the top of `zap.rs`: a window that closes on
+the channel already playing (Up then Down, or a full lap) ends in `Idle` and asks for nothing; a tune the app took no
+request for ends the zap on **`AppMsg::LiveTuneRefused`** (sent by `app::playback::tune_live_channel`'s refusal arm), never
+on an inference from timing; BACK / STOP are `Cancel`. **`Art`** is driven by one `ArtEvent` a frame (`Zapping`, `NoFrame`,
+`Frame`): `Waiting` before anything is known, `Covering` from the first press and while the stream has shown no frame yet,
+`Fading` once one exists, then `Settled`: a later stall or rebuffer never brings the art back, only a zap does. It is drawn by
+`plx_ui::art_ground` (the target programme's art over the video plane's hole, scaled 1.08 at 0.85 brightness: one textured quad of a blurred copy made once per
+image (`art_fit::Derive`, requested with the art, `tex::resolve_art_on`), never the live glass, so it is as soft over a
+bound video plane as anywhere; art with a clear ground stands on the app's flat ground: never black). **`Banner`** (`Entering`,
+`Shown { until }`) is raised on every stream the app starts (`AppMsg::PlayerStart`, through `Live::started`), on every press, and on
+Left, Right and OK; `Entering` is the page's first state, before it has a clock (the `PlayerStart` of the first mount is
+sent before the page exists), and its first frame stamps the deadline. It is held while a zap is in flight or no picture
+is there, fading .35 s after four seconds: `appkit::player_hud::live::SHOW_MS` / `FADE_MS`, declared values of the banner, not
+`LINGER_MS`. The lineup the zap steps through is `PlayerLike::lineup` (a provided method; the app answers it with the store's
+view) and the banner's placement is the HUD package's `layout.live` (`Compiled::live`, format 1.2). The page's one
+live predicate is `plx_media::route::is_live(ps)`; `HudModel` carries no live flag. The tests are `player/live_tests.rs`,
+`zap.rs`'s own and, through the real loop, `src/app/livetv_routing_tests.rs`.
+
+**BACK lands on the channel left.** `app::playback::exit_player` names the channel the session was tuned to before it
+stops it and tells the page the player was launched from (`bridge::seat_live_channel`, `AppMsg::LiveTvSeat`, a covered
+page still receives an addressed command); `LiveTvScreen` keeps it and, on `Enter::Restored`, seats that channel's card:
+its Recent tile, else its On now poster, else its Channels tile (`left_elem`); on the Guide scope the channel's row, at the
+cell of what was airing, with that row's page showing. OK on that card tunes it again.
+
+**The Guide's window scrolls by half hours.** `Mode::Guide(Board)` carries the board and the board its window, `Window::Live`
+(the half hour before now, rolling with the clock) or `Window::Ahead(start)` (held where the reader moved it). RIGHT past a
+row's last cell, or LEFT past its first, is handed to the screen (`EdgeRule::Screen`) and moves the window 30 minutes later
+(as far as the server has guide data: a window that would hold no programme is refused) or earlier (never before the live
+window); the store is told how far to read (`LiveTvCmd::Reach`, the window's end and a step) and releases it when the page
+leaves. BACK first returns a scrolled window to the live one; a scope chosen and a restore from the player open on it too. A
+frame with the instant and no zone offset still lays the board out (`H::instant`) and only omits the clock words.
+
+**A channel's guide row is ONE list** (`plx_plex::plex::livetv::Airings`, `Channel::airings`): every programme the guide read kept in start order
+(those that ended after the window's earliest start, which is the half hour at or before now, the one on now, and those to come), with the one on
+now a position in that list, readable only through `on_air()` / `now_title()` / `begins_at()` / `ends_at()`; there is no second copy of it
+to disagree with the list. The board turns each programme in the window into a cell (`Board::cells` holds its place in the row), so a programme that
+has already ended but still overlaps the window is a cell the grid shades as aired. **OK on a cell tunes the channel when its programme is on
+by the wall clock** (`Board::tunes`, whichever of the row it is), so OK on an aired programme is spent while another is on, as on one not begun; the
+unscheduled cell tunes, and so does any cell of a row with nothing on air and nothing ahead (every cell aired: the stale-read and the
+aired-only rows), so no row is left that cannot be tuned. A programme the guide gives no end is a cell to the next one's start, else the window's end. Focus lands on what is airing: the board is entered, a move from an unscheduled row goes and the player's return seats
+(`left_elem`) the cell on now (`TimeGrid::entry` / `land`), never merely the row's first cell, which may have aired.
+
+## Number entry (Live TV PR5)
+
+A digit typed on the What's on page, the Guide or over the live player opens **one registered surface**, `AppArg::ChannelEntry`
+(`channel_entry_panel.rs`, canon tag 16, page id 33, namespace `channel_entry`): a top-right panel on the safe frame
+(`ui::popover::corner_panel`: right 96, top 54, 560 wide) with the typed number, a window of five rows on `TableView`'s
+lineup face (`TableView::lineup`, `Row::lead`: the number in its own column, the station beside it) and "+N more" under
+the window. **What it decides is one pure machine**, `channel_entry::NumberEntry` (`Fresh`, `Typing`, `Done`; events
+`Digit`, `Moved`, `Touch`, `Ok`, `Back`, `Tick`; one effect, `Seat`, `Tune` or `Leave`; time passed in): the digits
+narrow the lineup by PREFIX of each number's DIGITS (`6.1` is `61`: there is no dot key; the row shows `6.1`); a prefix that fits exactly ONE channel tunes at once, anything else only seats the highlight
+(the exact match, else the first that is not on screen) and waits `IDLE_MS` (2.5 s) after the last key, which restarts on
+every key; OK tunes the highlight, BACK closes with no tune; the channel already on screen is tagged "Playing" and never
+retuned. The panel reports a choice as `AppMsg::LiveChannelPicked` to the instance named on its argument and starts
+nothing itself, so a pick takes the host's own tune path: the page's `ContentReq::Play`, and over the player
+`ZapEvent::Jump` (`Live::jump`), which makes the ONE `PlayerReq::Tune` on the next frame with the banner and art
+following, exactly as a zap. The page opens it as `ContentPanel::ChannelEntry` (`Style::Compact`); the player asks
+`PlayerReq::OpenChannelEntry`, presented as `Style::PlayerPanel` (`bridge::open_channel_entry`), which leaves the host
+live so the video plane keeps presenting under it, and the digit drops a zap still pending (`Live::cancel_zap`).
+Its ground is derived from that style: `Ground::Menu` with `Scrim::over_host(DIM_COMPACT)`, so over the page the
+container owes the dim, the field latches and the panel is glass, and over the player nothing latches and it is the
+sheet with no dim on the picture (and `popover_glass` never draws glass on a video-plane frame).
+It is one surface however many keys ask for it: a request for a panel that is mounted is refused (the key reaches it as
+input), and one for a panel whose `Present` is still parked for this frame's commit is folded into the parked argument
+as one more opening digit (`bridge::present_once`, `Dispatcher::parked_present_mut`, `AppArg::absorb`). A panel dismissed
+from outside (a press that misses it) hears `Closing` and stops acting, so its timer cannot tune afterwards.
+
+## Browse (Live TV PR7)
+
+The scope row's third stop (`Scope::Browse(Filter)`), a grid of programmes under it (`livetv/browse.rs` is the pure half, `livetv.rs` the page).
+**The filter is the scope's own**: the scope carries it, so the filter exists exactly while Browse shows and no other scope can hold one
+that disagrees with the set on show; the filter control's menu (`livetv/filter_menu.rs`, `AppArg::LiveTvFilter`, canon tag 17, page id 34,
+namespace `livetv_filter`, opened as `ContentPanel::LiveTvFilter`) REPORTS a pick (`AppMsg::LiveTvFilterPicked`) and the page changes the
+filter on that message alone (`LiveTvScreen::pick_filter`), rebuilding the set at once. The control is the row's last stop, drawn as the Library's sort
+control (`HeaderItem::sort_control`), with "3 of 16" (the Library's own `library_header.filtered_of`) before it while a filter narrows what is on.
+**A card is a programme**, not a channel: `browse::shown` lists one per programme of a channel's guide row (`Channel::airings`, in channel then
+start order; one that has aired is no card under any filter), and what a programme IS right now is `browse::stand` (the clock and its own times, never where the read put it). The rules:
+On now = begun and not over (an airing with no known end is on while it has begun); Just started = on and at most 10 whole minutes in; Ending soon =
+on and at most 15 minutes left (whole minutes, rounded up; an open-ended airing is never ending soon); Later today = not begun and before the end of the
+local day (`browse::day_end`: the next local midnight from the frame's zone offset, the UTC day without one). The count reads "shown of on now" for the
+two narrowing filters only. The set is rebuilt by `Page::sync` when the store, the scope or the day changes and when the clock reaches the first instant
+anything can change (`browse::next_change`: a start, ten minutes after it, fifteen before the end, the end), so the grid follows the clock with no event.
+**A card's element is its programme's** (`Idents`, `livetv/idents.rs`: server, DVR, channel key and start, allocated the first time it is shown, counting up from
+`BROWSE_FIRST_ELEM`, never reused in the page's life and not capped, looked up by borrowing the channel's strings; when the local day turns it forgets the
+programmes that began before the previous day and are not on show), so the focus follows the programme across filters, clocks and refreshes. A focused
+card that leaves the set (`StackPage::recover`) goes to its channel's card, else the one where the channel would stand (`browse::seat_for`); with nothing
+shown it falls to the filter control (`Mode::BrowseNone`, the empty read-out under the row, the control the one stop). OK on a programme on air tunes
+its channel (the page's play path) and does nothing on a later one, as the Guide does; BACK from the player seats the card of the programme tuned
+(`left_elem`, the same rule). Later today asks the store to read to the end of the day through `LiveTvCmd::Reach` (the Guide's own re-read path; the
+other filters ask for nothing): that far read is made once when the reach grows and again every window step (30 minutes), while the scheduled refresh of what
+is on now asks the live window alone and keeps the far programmes the last far read answered (`data/src/livetv.rs`, `merge_far`). The grid is the shared `cards::Grid` (six columns of `RowStyle::PROGRAMME` posters on the Library's 280 pitch from y 244) and
+the row above it **rides the page as the Library's does** (owner decision 2026-11-27; `library/header.rs`: "the row scrolls away with the page"): from the second row
+it scrolls off with the grid and the top bar tucks through the one `scroll_chrome::Handoff`, and UP from the first row reaches the filter and the scope row and scrolls the
+page back; the control it opens the menu from is the opener lift's (`redraw_opener`, shifted by the page's scroll). The row is built with `SharedRow::get_replacing`
+and a `HeaderSwap`, so the filter word and the count dissolve; the filter menu is a host of the shared `plx_ui::menu::Menu`, built by `Menu::from_header_pill` as the Watchlist's Sort & Filter menu
+is: a pick is reported to the page and the menu stays up with the check moved. The next row stands under the focused row's label
+band as every shipped grid's does (`caption_policy::BAND_TWO_LINES`, 112: y 731), not at the board's 735.

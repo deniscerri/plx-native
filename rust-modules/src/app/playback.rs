@@ -20,7 +20,6 @@
 //! through a `PlayerReq`.
 
 use super::*;
-use plx_media::player::report::AttemptOrigin;
 mod queue_transport;
 // The list is what the LOOP still spells, and phase 12 (PX-PLAYER) is why it is short: the scrub
 // gesture's constants and its two pure policies (`scrub_press`, `failed_key_action`) are read by
@@ -115,22 +114,7 @@ pub(crate) fn apply_more_action(ps: &mut plx_media::route::PlaybackSession, pa: 
         // running stream. Not deferred either: `route::set_quality` re-asks the routing question
         // for the playback on screen and reloads only when the answer changed.
         plx_appkit::more_menu::Action::SetQuality(q) => {
-            if plx_media::player::server_stop_applies(ps) {
-                return;
-            }
-            // A terminal Engine never reaches pump's pending-retranscode arm, and a `/decision`
-            // refusal has no Engine at all.  Persist the pick first, then make a fresh playback
-            // request at the same user-visible position.  Selecting the already-active rung is
-            // therefore the promised plain Retry.
-            let failed = matches!(plx_media::player::state(ps), plx_media::player::PlaybackState::Error);
-            if failed {
-                plx_media::route::set_quality_for_retry(q);
-                if retry_failed_playback(ps, pa, bridge.metadata_mut(), None, AttemptOrigin::QualityChange) {
-                    present.note_in_scope(plx_machine::present::Scope::Page, plx_machine::present::PresentEvent::Damage(plx_machine::present::Provenance::Input));
-                }
-            } else {
-                plx_media::route::set_quality(ps, q);
-            }
+            apply_quality(ps, pa, bridge, q, present);
         }
         // A URI speed pick re-resolves the same source for a Feed-capable executor. The common
         // route request owns its new bounded episode; missing clock or pause evidence refuses
@@ -156,6 +140,104 @@ pub(crate) fn apply_more_action(ps: &mut plx_media::route::PlaybackSession, pa: 
     }
 }
 
+pub(super) fn apply_quality(
+    ps: &mut plx_media::route::PlaybackSession,
+    pa: &mut plx_media::player::adapter::PlayerAdapter,
+    bridge: &mut super::bridge::Bridge,
+    quality: plx_media::route::Quality,
+    present: &mut plx_machine::present::Present,
+) -> bool {
+    if plx_media::player::server_stop_applies(ps) {
+        return false;
+    }
+    // A terminal Engine never reaches pump's pending-retranscode arm, and a `/decision`
+    // refusal has no Engine at all.  Persist the pick first, then make a fresh playback
+    // request at the same user-visible position.  Selecting the already-active rung is
+    // therefore the promised plain Retry.
+    //
+    // The discriminator is the STATE, not "a failure is recorded": the dev trigger records one over a playing session,
+    // whose rung is the live ladder's.
+    let failed = matches!(plx_media::player::state(ps), plx_media::player::PlaybackState::Error);
+    if failed {
+        // A rung on a failure is a recovery, through the one door: the viewer's choice is taken (`true`) whether or
+        // not the retry could start, and refused (`false`) only where the failure does not offer a rung.
+        match perform_recovery(ps, pa, bridge.metadata_mut(), plx_media::player::Recovery::PickQuality(quality)) {
+            Recovered::Started => present.note_in_scope(plx_machine::present::Scope::Page, plx_machine::present::PresentEvent::Damage(plx_machine::present::Provenance::Input)),
+            Recovered::Kept => {}
+            Recovered::Refused => return false,
+        }
+    } else {
+        return plx_media::route::set_quality(ps, quality);
+    }
+    true
+}
+
+/// How a recovery ended ([`perform_recovery`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Recovered {
+    /// The failed attempt was replaced: a new resolve of the request is in flight.
+    Started,
+    /// The recovery was taken and what it writes was written, but the retry could not start (nothing to resolve
+    /// again, or the failed attempt could not be stopped). A track pick stays held for *Try again*.
+    Kept,
+    /// Nothing was done: a server's stop ended the playback, or the failure does not offer the recovery.
+    Refused,
+}
+
+/// **Perform one of the failure read-out's recoveries** (`player::Recovery`): the ONE performer of *Try again*,
+/// *Play automatically*, a rung picked on the failure and a track pick made on the failure screen. The same steps in
+/// the same order whichever it is:
+///
+/// 1. a server's stop ended the playback: nothing is written or retried ([`Recovered::Refused`]);
+/// 2. [`plx_media::route::begin_recovery`] (the door) refuses what the failure's row does not offer, holds a track
+///    pick on the session and answers the retry's overrides;
+/// 3. the recovery's preference write, ahead of the retry because the resolve reads it: Auto for *Play automatically*
+///    (the one write door, `route::choose`, `How::Optimistic`: the live cell published ONCE and the seated profile's
+///    record saved behind it, which a failed save only logs) or the rung for a quality pick;
+/// 4. the retry itself ([`retry_failed_playback`]).
+pub(crate) fn perform_recovery(
+    ps: &mut plx_media::route::PlaybackSession,
+    pa: &mut plx_media::player::adapter::PlayerAdapter,
+    meta: &mut plx_data::stores::metadata::MetadataStore,
+    recovery: plx_media::player::Recovery,
+) -> Recovered {
+    perform_recovery_with(ps, pa, meta, recovery, || {})
+}
+
+/// [`perform_recovery`] with `accepted`: the caller's own writes for a recovery, run only once the door has accepted
+/// it and ahead of the retry (after step 3). A server stop or a refusal runs none of it, so a refused recovery writes
+/// nothing. The failure screen's track pick queues its selection PUT here.
+pub(crate) fn perform_recovery_with(
+    ps: &mut plx_media::route::PlaybackSession,
+    pa: &mut plx_media::player::adapter::PlayerAdapter,
+    meta: &mut plx_data::stores::metadata::MetadataStore,
+    recovery: plx_media::player::Recovery,
+    accepted: impl FnOnce(),
+) -> Recovered {
+    use plx_media::player::Recovery;
+    if plx_media::player::server_stop_applies(ps) {
+        return Recovered::Refused;
+    }
+    let live = plx_media::player::live_offers(ps, meta.view());
+    // The file the failed attempt landed on, from the versions the panel listed: a pick of it repeats a refusal.
+    let failed_media = plx_media::route::attempt_media(
+        ps, meta.view().failed_versions(plx_media::route::cur_sid(ps), &plx_media::route::cur_rk(ps)).unwrap_or(&[]));
+    let Ok(overrides) = plx_media::route::begin_recovery(ps, live, failed_media, &recovery) else {
+        return Recovered::Refused;
+    };
+    if let Some(mode) = overrides.direct_play {
+        // PERSISTENT, deliberately, not a one-shot: Force (or Disabled) is what made the play fail, and it would make
+        // the next unsupported file fail the same way. A pick of the SEATED profile: it resets that profile's mode and
+        // no other's, and with nobody seated the door refuses the save and the pick stands live only.
+        plx_media::route::choose::<plx_plex::plex::session::DirectPlayModePref>(mode, plx_media::route::How::Optimistic(None));
+    }
+    if let Recovery::PickQuality(quality) = recovery {
+        plx_media::route::set_quality_for_retry(quality);
+    }
+    accepted();
+    if retry_failed_playback(ps, pa, meta, overrides) { Recovered::Started } else { Recovered::Kept }
+}
+
 /// Replace a terminal attempt with a new resolve of the same Plex item.
 ///
 /// This is a REAL stop followed by a new request, not an Engine reload: it covers the pre-flight
@@ -163,16 +245,16 @@ pub(crate) fn apply_more_action(ps: &mut plx_media::route::PlaybackSession, pa: 
 /// and gives telemetry two honest attempts.  The descriptor lives in `route`; the app owns only
 /// the current playhead and the Engine lifecycle.
 ///
-/// `direct_play` overrides the Direct Play mode the retry resolves under; `None` keeps the failed
-/// attempt's own (a retry is the SAME request). `origin` is why the viewer asked — a Retry press
-/// or a quality pick on the failure screen — and rides to the error report of the attempt this
-/// starts, which is the next open of the same session.
-pub(crate) fn retry_failed_playback(
+/// `overrides` is what the viewer's recovery changes about the retry ([`plx_media::route::begin_recovery`] answers it):
+/// the Direct Play mode it resolves under (`None` keeps the failed attempt's own: a retry is the SAME request) and
+/// why the viewer asked (`AttemptOrigin`: a Retry press, a quality pick, a track pick), which rides to the error
+/// report of the attempt this starts, the next open of the same session. Private: a retry is only ever a
+/// recovery, performed by [`perform_recovery`].
+fn retry_failed_playback(
     ps: &mut plx_media::route::PlaybackSession,
     pa: &mut plx_media::player::adapter::PlayerAdapter,
     meta: &mut plx_data::stores::metadata::MetadataStore,
-    direct_play: Option<plx_plex::plex::session::DirectPlayMode>,
-    origin: AttemptOrigin,
+    overrides: plx_media::player::RetryOverrides,
 ) -> bool {
     // URL/dev-trigger playback has no Plex descriptor.  Check BEFORE teardown: extinguishing its
     // Error Engine and only then discovering it cannot be rebuilt would replace an actionable
@@ -194,36 +276,12 @@ pub(crate) fn retry_failed_playback(
     if !plx_media::player::stop_for_replacement(ps, pa) {
         return false;
     }
-    if plx_media::route::retry_current_play(ps, meta, resume_ns, direct_play, origin) {
+    if plx_media::route::retry_current_play(ps, meta, resume_ns, overrides) {
         true
     } else {
         log("playback retry: current source cannot be resolved again");
         false
     }
-}
-
-/// **The failure read-out's fix for Force Direct Play** — `FailureAction::PlayAutomatically`.
-///
-/// A PERSISTENT switch, deliberately, not a one-shot: Force is what made this play fail, and it
-/// would make the next unsupported file fail the same way. The preference moves to Auto now (the
-/// in-memory value every later resolve reads) and is saved on the storage worker behind it, both
-/// by the one write door (`route::choose`, `How::Optimistic`), as the SEATED profile's own pick: it
-/// resets that profile's Direct Play mode and no other's, and with nobody seated the door refuses
-/// the save and the pick stands live only. The frame may not block on storage,
-/// the cell is published ONCE, and a failed save is logged by the door while the pick stands for
-/// this session. The retry resolves under Auto explicitly rather than inheriting the failed
-/// attempt's Force, which a plain retry keeps on purpose.
-pub(crate) fn play_automatically(
-    ps: &mut plx_media::route::PlaybackSession,
-    pa: &mut plx_media::player::adapter::PlayerAdapter,
-    meta: &mut plx_data::stores::metadata::MetadataStore,
-) -> bool {
-    use plx_plex::plex::session::{DirectPlayMode, DirectPlayModePref};
-    if plx_media::player::server_stop_applies(ps) {
-        return false;
-    }
-    plx_media::route::choose::<DirectPlayModePref>(DirectPlayMode::Auto, plx_media::route::How::Optimistic(None));
-    retry_failed_playback(ps, pa, meta, Some(DirectPlayMode::Auto), AttemptOrigin::UserRetry)
 }
 
 /// **Where a session that is STARTING returns to** — the whole of what `app::nav::Origin` was,
@@ -450,6 +508,7 @@ pub(super) fn start_playback_with<R: PlaybackResources>(
     bridge: &mut super::bridge::Bridge,
     resources: &mut R,
 ) -> bool {
+    publish_live_banner(ps, bridge.livetv_view().channels);
     let entering = resources.prepare_start(ps, pa, resume_ns);
     if entering {
         enter_player(pages, bridge, from, ret);
@@ -481,6 +540,62 @@ pub(super) fn start_playback_with<R: PlaybackResources>(
     #[cfg(feature = "play-feed")]
     plx_media::player::commit_paused(ps, pa, false);
     entering
+}
+
+fn live_channel<'a>(ps: &plx_media::route::PlaybackSession, channels: &'a [plx_data::livetv::Channel])
+    -> Option<(usize, &'a plx_data::livetv::Channel)>
+{
+    let (sid, live) = plx_media::route::live_request(ps)?;
+    channels.iter().enumerate().find(|(_, ch)| ch.sid == sid && ch.dvr == live.dvr && ch.channel == live.channel)
+}
+
+/// Refresh the existing HUD caption from the current guide, including a programme rollover. The
+/// airing's time line is not kept here: the HUD words it at draw from the channel's raw begin and
+/// end and the frame's wall time (`plx_ui::fmt::airing_line`).
+pub(super) fn publish_live_banner(ps: &mut plx_media::route::PlaybackSession, channels: &[plx_data::livetv::Channel]) {
+    let Some((_, ch)) = live_channel(ps, channels) else {
+        plx_media::route::set_live_info(ps, None);
+        plx_media::route::set_live_context(ps, "");
+        return;
+    };
+    if plx_media::route::live_info(ps).is_some_and(|info| &info.channel == ch) { return; }
+    plx_media::route::set_live_info(ps, Some(plx_media::route::LiveInfo { channel: ch.clone() }));
+    let now = ch.airings.now_title();
+    let context = match (ch.vcn.is_empty(), now.is_empty()) {
+        (false, false) => plx_os::i18n::msg::widgets_live_channel_context(&ch.vcn, now),
+        (false, true) => ch.vcn.clone(),
+        (true, _) => now.to_owned(),
+    };
+    plx_media::route::set_live_context(ps, &context);
+}
+
+/// **Tune a live channel the player screen asked for** (its zap's debounce has closed on it): the same retire-and-start
+/// as a channel change has always been, now over a channel named by identity. The screen chose it from the lineup it
+/// read; a channel the lineup has since dropped still tunes, because the server decides what is on.
+fn tune_live_channel(
+    player: &mut plx_media::player::machine::Player,
+    pa: &mut plx_media::player::adapter::PlayerAdapter,
+    repause_at: &mut i64,
+    play: plx_screens::registry::PlayIntent,
+    pages: &mut plx_ui::dispatch::Dispatcher<super::bridge::AppHost>,
+    bridge: &mut super::bridge::Bridge,
+) {
+    // Read before the intent is consumed: the device log is the only place a refusal is visible.
+    let refused = match &play {
+        plx_screens::registry::PlayIntent::Live { dvr, channel, .. } => format!("livetv: channel change refused — the route took no live request for {channel} {dvr}"),
+        _ => return,
+    };
+    stop_player_resources(player, pa, repause_at, pages);
+    *repause_at = -1;
+    if super::content::request_play_intent(&mut player.session, bridge.metadata_mut(), &play) {
+        start_playback(&mut player.session, pa, 0, Origin::Here, HUD_LINGER_MS, None, pages, bridge);
+    } else {
+        // The retune took no request (a resolve still in flight, or a route that refused it): the
+        // old channel has already been stopped, so this is a failed change, not an ignored one. The page is told, so
+        // its zap ends on the refusal and not on a guess from timing.
+        log(&refused);
+        super::bridge::send_player_message(pages, plx_screens::registry::AppMsg::LiveTuneRefused);
+    }
 }
 
 /// Legacy card launches resolve media data without creating an invisible Detail screen.
@@ -616,8 +731,10 @@ pub(crate) fn drain_uri_track_fallbacks(ps: &mut plx_media::route::PlaybackSessi
 /// policy is the route's and not this file's.
 ///
 /// **This is where a track pick is also REMEMBERED** (the `memo` the panel built from the picked
-/// row): the `*_pick` commits write the show's track memory when, and only when, the route
-/// accepted the pick, an episode is playing and the seat is the viewer's. A subtitle OK that
+/// row): the `*_pick` commits write the show's track memory for a pick the route applied
+/// natively or in place at once, and for one that rides a server rebuild when its claim is accepted
+/// (never when the server refuses it, #1522), and only while an episode is playing and the seat is
+/// the viewer's. A subtitle OK that
 /// changes nothing (the menu closed on the row already shown) commits without a memo and writes
 /// nothing; the same holds for an OK on the Forced only row that already holds the mode
 /// (`TrackCommit::SubtitleForcedOnly`'s `changed`), which recommits what is on screen. No other door writes it:
@@ -631,7 +748,7 @@ pub(crate) fn commit_track(
     pa: &mut plx_media::player::adapter::PlayerAdapter,
     meta: &mut plx_data::stores::metadata::MetadataStore,
     commit: plx_appkit::track_menu::TrackCommit,
-) {
+) -> bool {
     use plx_appkit::track_menu::TrackCommit;
     match commit {
         TrackCommit::Audio { carried, memo } => {
@@ -639,11 +756,11 @@ pub(crate) fn commit_track(
                 if pa.uri_maps_track(ps, plx_playback_contract::TrackKind::Audio,
                     carried.sid) == Some(false)
                     || !pa.commit_audio_track(ps, carried.clone(), memo.clone()) {
-                    let _ = reconfigure_uri_audio(ps, pa, meta, carried.sid, memo);
+                    return reconfigure_uri_audio(ps, pa, meta, carried.sid, memo);
                 }
-                return;
+                return true;
             }
-            pa.commit_audio_track(ps, carried, memo);
+            return pa.commit_audio_track(ps, carried, memo);
         }
         TrackCommit::AudioEnhancement(a) => {
             if ps.attempt_view().backend() == Some(plx_media::player::attempt_view::Backend::Uri) {
@@ -661,18 +778,21 @@ pub(crate) fn commit_track(
         // (`route::commit_subtitle_and_sidecar`): the sidecar policy lives beside the track memory's.
         TrackCommit::Subtitle { render_ordinal, stream_id, sidecar_key, sidecar_codec, memo } => {
             if ps.attempt_view().backend() == Some(plx_media::player::attempt_view::Backend::Uri) {
-                if render_ordinal < 0 || sidecar_key.is_some()
+                // Off names no native track: a driver that hands its cues to the app carries it (`select_uri_subtitle`:
+                // the app no longer draws them), and only a refusal re-resolves it. Any other driver re-resolves Off.
+                let off = stream_id == 0 && sidecar_key.is_none() && pa.uri_delivers_captions();
+                if (!off && (render_ordinal < 0 || sidecar_key.is_some()
                     || pa.uri_maps_track(ps, plx_playback_contract::TrackKind::Subtitle,
-                        stream_id) == Some(false)
+                        stream_id) == Some(false)))
                     || !pa.commit_subtitle_track(ps, render_ordinal, stream_id,
                         sidecar_key.clone(), sidecar_codec.clone(), memo.clone()) {
                     let mode = if stream_id == 0 { plx_media::route::SubMode::Off }
                         else { plx_media::route::SubMode::Track };
-                    let _ = reconfigure_uri_subtitle(ps, pa, meta, stream_id, mode, None, memo);
+                    return reconfigure_uri_subtitle(ps, pa, meta, stream_id, mode, None, memo);
                 }
-                return;
+                return true;
             }
-            pa.commit_subtitle_track(ps, render_ordinal, stream_id, sidecar_key, sidecar_codec, memo);
+            return pa.commit_subtitle_track(ps, render_ordinal, stream_id, sidecar_key, sidecar_codec, memo);
         }
         // Forced only (FO): the panel matched the forced track for the playing audio (or nothing),
         // the route holds the mode and remembers `ForcedOnly { lang }` when it changed, and drops
@@ -684,7 +804,7 @@ pub(crate) fn commit_track(
                         lang: lang.clone() });
                 let _ = reconfigure_uri_subtitle(ps, pa, meta, stream_id,
                     plx_media::route::SubMode::ForcedOnly, Some(lang), memo);
-                return;
+                return true;
             }
             pa.commit_forced_only_track(ps, render_ordinal, stream_id, &lang, changed);
         }
@@ -697,6 +817,7 @@ pub(crate) fn commit_track(
             plx_media::route::persist_subtitle_offset(ps, offset);
         }
     }
+    true
 }
 
 #[derive(Default)]
@@ -817,13 +938,8 @@ pub(crate) fn player_requests(
                     plx_machine::machine::Delivery::Screen(plx_ui::screen::ScreenEvent::App(
                         plx_screens::registry::AppMsg::AutoSkipResolved { id, outcome }))));
             }
-            PlayerReq::RetryPlayback => {
-                if retry_failed_playback(&mut player.session, pa, bridge.metadata_mut(), None, AttemptOrigin::UserRetry) {
-                    pages.present.note_in_scope(plx_machine::present::Scope::Page, plx_machine::present::PresentEvent::Damage(plx_machine::present::Provenance::Input));
-                }
-            }
-            PlayerReq::PlayAutomatically => {
-                if play_automatically(&mut player.session, pa, bridge.metadata_mut()) {
+            PlayerReq::Recover(recovery) => {
+                if perform_recovery(&mut player.session, pa, bridge.metadata_mut(), recovery) == Recovered::Started {
                     pages.present.note_in_scope(plx_machine::present::Scope::Page, plx_machine::present::PresentEvent::Damage(plx_machine::present::Provenance::Input));
                 }
             }
@@ -840,18 +956,26 @@ pub(crate) fn player_requests(
             }
             // The fall-through a surface cannot perform (`screens::player::overlay`'s module doc):
             // the same toggle the bare transport reaches, with the panel left untouched.
-            PlayerReq::Transport(play) => apply_transport(&mut player.session, pa, play, now, pages),
+            PlayerReq::Transport(play) => { apply_transport(&mut player.session, pa, play, now, pages); }
+            PlayerReq::Tune { sid, dvr, channel, title } => tune_live_channel(
+                player, pa, repause_at, plx_screens::registry::PlayIntent::Live { sid, dvr, channel, title }, pages, bridge),
             PlayerReq::SeekTo(ns) => apply_seek_to(&mut player.session, pa, ns),
             // …and its twin, which does NOT resume: the scrub bar is how a paused film is moved.
             // The pump keeps the pause across it (see `commit_seek`).
             PlayerReq::CommitSeek(ns) => commit_seek(&mut player.session, pa, ns),
             PlayerReq::More(action) => apply_more_action(&mut player.session, pa, bridge, action, &mut pages.present),
-            PlayerReq::CommitTrack(commit) =>
-                commit_track(&mut player.session, pa, bridge.metadata_mut(), commit),
+            PlayerReq::CommitTrack(commit) => {
+                commit_track(&mut player.session, pa, bridge.metadata_mut(), commit);
+            }
             // The failure-read-out's recovery escape (`ChooseQuality`) and the Tracks->Timing hand-off, which
             // present a panel immediately rather than through the row's deferred press. The
             // tabs row is not an asker: it asks `ToggleSection` (Info and Chapters are sections).
+            PlayerReq::OpenFailedTracks { anchor } => super::bridge::open_failed_tracks(&player.session, anchor, pages),
+            PlayerReq::OpenFailedVersions { anchor } => super::bridge::open_failed_versions(&player.session, bridge.metadata_view(), anchor, pages),
+            // A digit over a live channel (Live TV PR5): number entry, a player panel that leaves the video live.
+            PlayerReq::OpenChannelEntry { first, playing } => super::bridge::open_channel_entry(first, playing, pages),
             PlayerReq::OpenOverlay(kind) => {
+                if plx_media::route::is_live(&player.session) { continue; }
                 seed_menu_anchor(pages, bridge, kind);
                 super::bridge::open_player_overlay(&mut player.session, bridge.metadata_view(), pages, kind);
             }
@@ -944,6 +1068,24 @@ pub(crate) fn exit_player(
     refresh_hubs: &mut bool,
     pages: &mut plx_ui::dispatch::Dispatcher<super::bridge::AppHost>,
 ) {
+    // The channel the viewer is leaving, named before the stop retires the request: the page they return to seats it.
+    let left = plx_media::route::live_request(&player.session).map(|(sid, tune)| (sid, tune.dvr.clone(), tune.channel.clone()));
+    stop_player_resources(player, pa, repause_at, pages);
+    if let Some((sid, dvr, channel)) = left {
+        super::bridge::seat_live_channel(pages, sid, dvr, channel);
+    }
+    // Return to the original container entry, retaining its focus and page memory.
+    return_from_player(pages);
+    *refresh_hubs = true;
+}
+
+/// A channel switch retires the same resources as Exit while retaining the mounted return path.
+fn stop_player_resources(
+    player: &mut plx_media::player::machine::Player,
+    pa: &mut plx_media::player::adapter::PlayerAdapter,
+    repause_at: &mut i64,
+    pages: &mut plx_ui::dispatch::Dispatcher<super::bridge::AppHost>,
+) {
     // The foreground machine hears the exit FIRST: a restore parked or refused behind this exit
     // is retired here (`Superseded(Exit)`), not left standing for the next play to release.
     let _ = drive_foreground(
@@ -966,15 +1108,6 @@ pub(crate) fn exit_player(
     // lives on `ps.jail_load_blocked`, and `cancel_play` at the top of this function clears it
     // via `clear_play_verdict` the same way it clears a `/decision` refusal — see that function's
     // doc for why a verdict left standing described the item the user walked away from.
-    // **The return is a `PopTo` of the ORIGIN ENTRY** (§5.1) — the page that was on top when the
-    // push was asked for, captured at the player's own mount and read back off the instance. It
-    // replaces `App.play_from: Node` plus `enter_node` plus `Trail::ensure`, which between them
-    // said "re-derive a page from a remembered description, then make the history agree". An
-    // entry needs no re-deriving and there is no second history to reconcile. A stale entry falls
-    // through `nav_pop_to`'s Home floor; a live Content entry with no identity takes the explicit
-    // Home floor in `return_from_player`, preserving `return_page`'s old anti-strand contract.
-    return_from_player(pages);
-    *refresh_hubs = true;
 }
 
 /// **Home appears already correct** (layer-1 view state, owner decision 2): when the page being
@@ -1419,6 +1552,7 @@ pub(crate) fn perform_hud_command(
     use plx_appkit::player_hud::command::HudCommand;
     use plx_media::route::QueueStep;
     use plx_screens::player::overlay::OverlayKind;
+    if plx_media::route::is_live(&player.session) && !command.shown_live() { return; }
     match command {
         HudCommand::TogglePlay | HudCommand::Seek(_) => {
             super::bridge::send_player_message(pages,
@@ -1460,17 +1594,18 @@ pub(crate) fn perform_hud_command(
 /// Perform a [`PlayerReq::Transport`](plx_screens::registry::PlayerReq::Transport): the play/pause toggle (or a one-way PLAY or PAUSE), then keep the
 /// transport up. The one path the keys, OK on the picture, a panel's fall-through and the
 /// `toggle_play` command share.
-fn apply_transport(
+pub(super) fn apply_transport(
     ps: &mut plx_media::route::PlaybackSession,
     pa: &mut plx_media::player::adapter::PlayerAdapter,
     play: Option<bool>,
     now: u32,
     pages: &mut plx_ui::dispatch::Dispatcher<super::bridge::AppHost>,
-) {
+) -> bool {
     let target = super::lifecycle::transport_target(play, super::lifecycle::viewer_paused_for(ps, pa));
-    set_transport_paused(ps, pa, target);
+    let accepted = set_transport_paused(ps, pa, target);
     super::bridge::send_player_message(pages,
         plx_screens::registry::AppMsg::PlayerExtendHud { now, duration_ms: HUD_LINGER_MS });
+    accepted
 }
 
 /// Perform a [`PlayerReq::SeekTo`](plx_screens::registry::PlayerReq::SeekTo): seek, and resume a paused film.
@@ -1600,7 +1735,7 @@ pub(crate) unsafe fn key_play(
 pub(crate) fn land_play_then_observe<S: ?Sized>(
     state: &mut S,
     land: impl FnOnce(&mut S),
-    observe: impl FnOnce(&S),
+    observe: impl FnOnce(&mut S),
 ) {
     land(state);
     observe(state);
@@ -2165,4 +2300,39 @@ fn perform_skip_prompt(player: &mut plx_media::player::machine::Player,
                 }
             }
 
+}
+
+#[cfg(test)]
+mod uri_subtitle_off_tests {
+    //! **Off on a URI driver that hands its cues to the app** (the Tizen driver). The track menu commits Off as
+    //! `render_ordinal: -1, stream_id: 0`; `commit_track` must hand it to the driver (`select_uri_subtitle`, where Off
+    //! is the app no longer drawing the cues), not to the re-resolve door, which refuses it on a qualifier that
+    //! cannot carry a source track change and leaves the subtitle drawing.
+    use plx_appkit::track_menu::TrackCommit;
+    use plx_playback_contract::uri::NativeTrackIndex;
+    use plx_playback_contract::{Capabilities, Operation, TrackChoice, TrackKind, TrackSelection};
+
+    const CAPTIONING: Capabilities = Capabilities { progressive_uri: true, hls_uri: false, packet_feed: false,
+        pause: true, seek: true, audio_track: true, subtitle_track: true, audio_off: false, subtitle_off: true };
+
+    #[test]
+    fn off_on_a_captioning_uri_driver_is_asked_of_the_driver_not_re_resolved() {
+        let _serial = plx_base::testlock::serial();
+        let subtitle = TrackSelection { kind: TrackKind::Subtitle, id: 77 };
+        let (mut ps, mut pa, handle, route) = plx_media::player::adapter::open_fake_uri_for_test(CAPTIONING,
+            vec![NativeTrackIndex { selection: subtitle, index: 0 }]);
+        handle.set_delivers_captions(true);
+        let mut meta = plx_data::stores::metadata::MetadataStore::default();
+
+        assert!(super::commit_track(&mut ps, &mut pa, &mut meta, TrackCommit::Subtitle { render_ordinal: -1,
+            stream_id: 0, sidecar_key: None, sidecar_codec: String::new(),
+            memo: Some(plx_plex::plex::session::prefs::SubtitleMemo::Off) }), "the Off pick is accepted");
+        let offs: Vec<_> = handle.dispatched().into_iter().filter(|(attempt, _, operation)|
+            *attempt == route.contract_id() && *operation == Operation::SelectTrack { kind: TrackKind::Subtitle,
+                choice: TrackChoice::Off }).collect();
+        assert_eq!(offs.len(), 1, "Off reached the driver once: {:?}", handle.dispatched());
+        assert!(!plx_media::route::play_pending(), "nothing was re-resolved");
+        assert_eq!(pa.backend_snapshot().phase, plx_playback_contract::Phase::Active, "the play goes on");
+        plx_media::route::reset_player_control_for_test(&ps);
+    }
 }

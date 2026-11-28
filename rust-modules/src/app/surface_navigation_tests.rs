@@ -27,7 +27,7 @@ fn content_instances_compare_item_identity_and_keep_distinct_entries() {
 #[test]
 fn a_page_arg_wears_the_chrome_its_own_table_says() {
     for r in every_route() {
-        let want = if matches!(r, AppArg::Home | AppArg::Search | AppArg::Watchlist) || r.is_library_family() {
+        let want = if matches!(r, AppArg::Home | AppArg::Search | AppArg::Watchlist | AppArg::LiveTv) || r.is_library_family() {
             Chrome::TabBar
         } else {
             Chrome::None
@@ -1225,8 +1225,8 @@ fn a_seeded_menu_anchor_is_mounted_into_the_next_menu_and_only_that_one() {
     let mut rig = owner.bridge();
     frame(&mut d, &mut rig, AppArg::Player, tick(0), vec![]);
     let anchor_of = |d: &mut Dispatcher<AppHost>| match player_overlay_mut(d).expect("a panel is up").panel() {
-        Panel::Tracks(p) => p.anchor(),
-        Panel::More(p) => p.anchor(),
+        Panel::Tracks(p) => p.menu().anchor().expect("a video card hangs from an anchor"),
+        Panel::More(p) => p.menu().anchor().expect("a video card hangs from an anchor"),
         _ => panic!("a menu"),
     };
     let seeded = plx_ui::Rect::new(333.0, 222.0, 111.0, 55.0);

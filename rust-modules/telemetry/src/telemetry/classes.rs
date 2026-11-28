@@ -1185,8 +1185,13 @@ pub enum FailureClass {
     /// The resolve produced no playable plan and no verdict: no Engine ever ran (a resolve with no
     /// client, or whose worker never spawned).
     ResolveFailed,
+    TunersBusy,
     /// A hero/trailer preview refused because its route was not a direct play.
     PreviewNotDirect,
+    /// The app's own refusal: this build composed no backend that can play the item (on Tizen, every
+    /// refused play), so the server was never asked. Distinct from [`DecisionRefused`](Self::DecisionRefused),
+    /// which is the server's.
+    NoQualifiedBackend,
     ServerStopped,
     /// Everything else. Honest rather than tidy.
     Unspecified,
@@ -1196,7 +1201,7 @@ impl FailureClass {
     /// Every class, in declaration order. The consent legend's failure-kind row is built from it
     /// (every class reaches the handled report), and a test holds the declared `playback.failed`
     /// domain to the enum it is built from.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 17] = [
         Self::DecisionRefused,
         Self::PlaybackPolicy,
         Self::NoVideoTranscodeTarget,
@@ -1209,7 +1214,9 @@ impl FailureClass {
         Self::LoadTimeout,
         Self::ReleaseTimeout,
         Self::ResolveFailed,
+        Self::TunersBusy,
         Self::PreviewNotDirect,
+        Self::NoQualifiedBackend,
         Self::ServerStopped,
         Self::Unspecified,
     ];
@@ -1230,7 +1237,9 @@ impl FailureClass {
             Self::LoadTimeout => "load_timeout",
             Self::ReleaseTimeout => "release_timeout",
             Self::ResolveFailed => "resolve_failed",
+            Self::TunersBusy => "tuners_busy",
             Self::PreviewNotDirect => "preview_not_direct",
+            Self::NoQualifiedBackend => "no_qualified_backend",
             Self::ServerStopped => "server_stopped",
             Self::Unspecified => "unspecified",
         }

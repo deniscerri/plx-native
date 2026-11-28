@@ -14,7 +14,7 @@
 //! * `bridge::follow_auth_landing`, at every credentials handoff (`Ready`), which a profile switch
 //!   ends in;
 //! * the doors that pick a value (`route::select_subtitle_size`, `route::set_direct_play_mode`,
-//!   `playback::play_automatically`), which wrote the record's top-level key.
+//!   `playback::perform_recovery(Recovery::PlayAutomatically)`), which wrote the record's top-level key.
 //!
 //! Now the cells hold the SEATED profile's values: boot restores `Unseated` (the fallback), the
 //! seat trigger (`bridge::SeatWatch`) restores at every seat change and nowhere else, and the doors
@@ -520,8 +520,11 @@ fn profile_picks_are_each_profiles_own_and_play_automatically_on_b_leaves_a_alon
     let mut adapter = plx_media::player::adapter::PlayerAdapter::new(unsafe {
         plx_base::task::MainThread::assume()
     });
-    assert!(!crate::app::playback::play_automatically(&mut player.session, &mut adapter, rig.metadata_mut()),
-        "there is no reusable Plex request to retry, so only the preference moves");
+    failed_under_force(&mut player);
+    assert_eq!(crate::app::playback::perform_recovery(&mut player.session, &mut adapter, rig.metadata_mut(),
+        plx_media::player::Recovery::PlayAutomatically),
+        crate::app::playback::Recovered::Started, "the failed request is resolved again under Auto");
+    plx_media::route::cancel_play(&mut player.session);
     assert_eq!(plx_media::route::direct_play_mode(), DirectPlayMode::Auto, "B's live cell moved at once");
     plx_base::storage_worker::drain_for_test();
     assert_eq!(stored_value::<DirectPlayModePref>("profile-b"), Some(DirectPlayMode::Auto), "...and B's record");
@@ -563,11 +566,26 @@ fn play_automatically_publishes_direct_play_auto_once() {
         plx_base::task::MainThread::assume()
     });
     let before = publishes_for_test::<DirectPlayModePref>();
-    crate::app::playback::play_automatically(&mut player.session, &mut adapter, rig.metadata_mut());
+    failed_under_force(&mut player);
+    crate::app::playback::perform_recovery(&mut player.session, &mut adapter, rig.metadata_mut(),
+        plx_media::player::Recovery::PlayAutomatically);
+    plx_media::route::cancel_play(&mut player.session);
     plx_base::storage_worker::drain_for_test();
     assert_eq!(publishes_for_test::<DirectPlayModePref>() - before, 1, "published exactly once");
     assert_eq!(plx_media::route::direct_play_mode(), DirectPlayMode::Auto);
     assert_eq!(stored_value::<DirectPlayModePref>("profile-a"), Some(DirectPlayMode::Auto), "and persisted behind it");
+}
+
+/// A playback that asked for item `m1` and FAILED under Force Direct Play (the dev trigger's `policy` arm, captured
+/// the way a frame captures it), so the read-out's row offers *Play automatically*. The recovery needs a failure that
+/// offers it and a request to repeat; neither says anything about the profile the tests below are about.
+fn failed_under_force(player: &mut plx_media::player::machine::Player) {
+    plx_media::route::seed_request_for_test(&mut player.session, "m1");
+    plx_media::player::observe_failure(
+        &mut player.session,
+        plx_media::player::FailureTrigger { arm: Some("policy"), armed: false },
+        plx_media::player::report::attempt_id(),
+    );
 }
 
 // ---- the seat trigger: what each way of arriving at a seat restores -----------------------------
@@ -608,6 +626,42 @@ fn boot_auto_sign_in_restores_the_seated_profile() {
     assert!(crate::app::boot::resume_stored(&mut d, &mut rig, &mut NoTap).is_some());
     assert_eq!(rig.retained.seat_watch.restored, seat_of("profile-b"));
     assert_eq!(cells(), OTHER, "the stored profile's own values, before Home mounts");
+}
+
+/// **A profile publication alone gives Live TV its Recent row.** The seat arrives through the real
+/// `SessionFx::PublishProfile` (`ResumeStored`), the memory door is seeded the way the handoff's
+/// restore seeds it (after the publication, as `follow_auth_landing` does), and nothing is tuned: the
+/// step's input reads the door's list when it is built, so the stored channels show. A list copied at
+/// the publication would have read the door before it was seeded, and shown nothing until the next tune.
+#[test]
+fn a_profile_publication_shows_the_stored_recent_row_with_no_tune() {
+    use plx_plex::plex::session::prefs::{MemoryEntry, ProfileMemory, RecentChannelEntry};
+    let _serial = plx_base::testlock::serial();
+    let mut stored = record("", &[]);
+    let stamp = plx_plex::plex::grant::account_key(&stored.account_token);
+    for n in ["1", "2"] {
+        let e = RecentChannelEntry::new(MACHINE, "7", &format!("C{n}"));
+        stored.prefs.recent_channels.upsert_with("", &stamp, &e.key(), e.noted());
+    }
+    let _fixture = Fixture::new("a0c-recent-publication", &stored);
+    let sid = plx_plex::plex::register_for_test(MACHINE, "127.0.0.1", 9, "synthetic", "fixture");
+    let (mut harness, _d) = resume(&stored);
+    let rig = harness.bridge();
+    assert_eq!(rig.retained.seat_watch.restored, seat_of(""), "the publication seated the owner");
+    // What the handoff's restore leaves: the process-global seat, and the door seeded from the record.
+    seat_globally("");
+    plx_media::route::restore_install_rows(&session::load());
+    let channel = |n: &str| plx_data::livetv::Channel { sid, dvr: "7".into(), channel: format!("C{n}"), vcn: n.into(),
+        name: format!("Channel {n}"), thumb: String::new(),
+        airings: plx_data::livetv::Airings::default() };
+    crate::app::adapters::stores::refill_client_keys(&mut rig.retained.client_keys);
+    // One step to register the roster's sources, then the lineup they would publish, then the step whose
+    // input carries the list.
+    rig.stores.livetv_pump(&rig.retained.livetv_input(&rig.retained.client_keys));
+    rig.stores.livetv.install_for_test(vec![channel("1"), channel("2"), channel("3")]);
+    rig.stores.livetv_pump(&rig.retained.livetv_input(&rig.retained.client_keys));
+    let row: Vec<_> = rig.livetv_view().recent.iter().map(|c| c.vcn.clone()).collect();
+    assert_eq!(row, ["2", "1"], "the stored channels, newest first, with no tune and no refresh");
 }
 
 /// **Case 2: the boot picker (plan 3.8.5a).** Auto sign-in off on a Home with two profiles:
@@ -920,7 +974,10 @@ fn play_automatically_resets_the_active_profiles_direct_play_only() {
     let mut adapter = plx_media::player::adapter::PlayerAdapter::new(unsafe {
         plx_base::task::MainThread::assume()
     });
-    crate::app::playback::play_automatically(&mut player.session, &mut adapter, rig.metadata_mut());
+    failed_under_force(&mut player);
+    crate::app::playback::perform_recovery(&mut player.session, &mut adapter, rig.metadata_mut(),
+        plx_media::player::Recovery::PlayAutomatically);
+    plx_media::route::cancel_play(&mut player.session);
     plx_base::storage_worker::drain_for_test();
     assert_eq!(plx_media::route::direct_play_mode(), DirectPlayMode::Auto);
     assert_eq!(stored_value::<DirectPlayModePref>("profile-a"), Some(DirectPlayMode::Auto), "A's record moved");

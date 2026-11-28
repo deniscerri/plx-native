@@ -58,6 +58,8 @@
   "widgets.card.show_new_episode": "{show} · Episod i ri",
   "widgets.failure.jail": "Luajtja dështoi — sandbox-i i këtij televizori bllokon videon vendase",
   "widgets.failure.refused": "Luajtja dështoi — serveri nuk mund ta luajë ose ta konvertojë këtë skedar",
+  "widgets.failure.direct_play_disabled": "Luajtja dështoi — Luajtja direkte është çaktivizuar",
+  "widgets.failure.no_backend": "Luajtja dështoi — ky televizor nuk mund ta luajë këtë skedar në PlxNative",
   "widgets.failure.audio_only": "Luajtja dështoi — serveri dërgoi vetëm audio",
   "widgets.failure.no_video": "Luajtja dështoi — skedari nuk ka video",
   "widgets.failure.open": "Luajtja dështoi — rrjedha mediatike nuk u hap dot",
@@ -65,6 +67,7 @@
   "widgets.failure.tv_rejected": "Luajtja dështoi — televizori e refuzoi rrjedhën",
   "widgets.reason.jail": "Sandbox-i i këtij televizori nuk i jep aplikacionit /dev/rtkmem",
   "widgets.reason.refused": "Serveri nuk mund ta luajë ose ta konvertojë këtë skedar",
+  "widgets.reason.no_backend": "PlxNative ende nuk mund ta luajë këtë skedar në këtë televizor",
   "widgets.reason.audio_only": "Serveri dërgoi vetëm audio — nuk gjeti objektiv të përdorshëm transkodimi për videon",
   "widgets.reason.no_video": "Ky skedar nuk ka pistë video",
   "widgets.reason.open": "Rrjedha mediatike nuk u hap dot",
@@ -252,5 +255,12 @@
   "widgets.region.latin_america": "Amerika Latine",
   "widgets.failure.play_auto": "Kalo në Automatik dhe luaj",
   "widgets.failure.change_quality": "Ndrysho cilësinë",
-  "widgets.watch.intro": "Shiko hyrjen"
+  "widgets.watch.intro": "Shiko hyrjen",
+  "widgets.verdict.tuners_busy": "Të gjithë tunerat janë të zënë",
+  "widgets.live.channel_context": "{number} · {programme}",
+  "widgets.live.badge": "LIVE",
+  "widgets.live.next_at": "Në vijim në {time}",
+  "widgets.live.entry_none": "Nuk ka kanal {number}",
+  "widgets.live.entry_more": "+{count} të tjerë · ▲ ▼ për të lëvizur",
+  "widgets.live.playing": "Po luhet"
 }

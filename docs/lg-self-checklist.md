@@ -130,7 +130,7 @@ skips; a partial green count is not equivalent to 21/21.
 
 | # | Item | Basis |
 | --- | --- | --- |
-| 1, 2 | Execution, main screen | Repeated device-suite launches reached the intended route. The 1920×1080 UI is held inside the 5% overscan frame by `MARGIN_X` 96 / `MARGIN_Y` 54 and the composed-geometry host gate. The splash is 1920×1080 and uses the app surface rather than a black field. |
+| 1, 2 | Execution, main screen | Repeated device-suite launches reached the intended route. The 1920×1080 UI is held inside the 5% overscan frame by `MARGIN_X` 96 / `MARGIN_Y` 54 and the composed-geometry host gate. The splash is 1920×1080 on a pure-black (#000000) field for OLED panels; LG's "should not be black" guidance is not enforced (`docs/distribution.md` §10.2). |
 | 6 | Correct text | `text::elide`, long-form scrolling, synthesized music-note glyphs, and the bundled CJK fallback cover the implemented scripts. The separate CJK visual acceptance run in §3 is still owed; this row does not claim RTL support. |
 | 7 | Focus / mouse-over | Idle, focused and selected states are distinct and were audited screen by screen at 1920×1080; the 16/16 FPS run exercised the integrated focus/transition scenes. |
 | 8 | Flickering | No flicker was observed in the completed device matrices; the known Dolby Vision Profile 5 pulse is fixed. |
@@ -146,7 +146,7 @@ skips; a partial green count is not equivalent to 21/21.
 ## 6. Decisions and N/A items
 
 **#41 — language setting.** Settings now offers System default, English, Spanish, Belarusian, French, Italian,
-Portuguese, German, Hungarian, Russian, Polish, Dutch and Albanian (the languages `locales/languages.json` registers), with changes applied at the next app launch. Localized launcher metadata still follows webOS.
+Portuguese, German, Hungarian, Russian, Polish, Dutch, Croatian and Albanian (the languages `locales/languages.json` registers), with changes applied at the next app launch. Localized launcher metadata still follows webOS.
 The native Settings Service supplies UI and formatting locales, and the resolved app language
 becomes `X-Plex-Language` for PMS. Native device checks on 2026-09-27 verified detection, persistence across restarts, Cyrillic
 text, consent scrolling and the contribution QR. See `docs/localization.md` for the scope.

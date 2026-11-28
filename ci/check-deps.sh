@@ -119,6 +119,16 @@
 #              `navcommit` when the flash was slow (`fps:modal-ramp`, device-measured 2026-09-09).
 #              Nothing failed: both doors return a `Session` and the difference is invisible at the
 #              call site, which is exactly what a grep gate is for. Count is zero.
+#   menudoors — every menu goes through `plx_ui::menu::Menu`, so the doors a host used to build
+#              one by hand are shut: `set_title(`, an assignment to `.compact`, a bool size-class
+#              constructor (`with_compact(`: the one size-class vocabulary is `menu::Class`, taken by
+#              `TableView::with_class` / `FormTable::with_class`), `PageStack::new` and
+#              `PanelMotion::new` are spelled ONLY in the component's own files (ui/src/menu.rs,
+#              menu_tests.rs, and the three types' own modules table.rs, page_stack.rs,
+#              panel_motion.rs). Visibility already refuses them outside the ui crate (`compact` is
+#              private, the other three are `pub(crate)`, no `with_compact` exists); this rule is the half visibility cannot
+#              see, ui-crate code outside those files. Zero, no allowlist: a screen that wants a
+#              menu builds a `Menu` (the size class is `menu::Class`, the title is the page's).
 # Plex paging rule:
 #   paging   — `X-Plex-Container-` is spelled in production Rust ONLY by `paged_path`'s file,
 #              rust-modules/plex/src/plex/paging.rs. Every other window is built through it. Zero,
@@ -195,7 +205,7 @@ ok()   { echo "  ok — $*"; }
 RULES=(browse-owner viewstate-owner person-owner search-owner hubs-owner metadata-owner libm ticks wall
   fpflags present effect mutators mutators-visibility nav ui-owner-legacy ui-owner-files owned-damage
   owned-wake cards layer sessionwrite screen-runtime-io uistorage legacypage sibling textmeasure dt ladder hittest frame
-  sink route fnlen testmod threads blocking workers globals forks fxlanes tmppath paging allowlist-counts)
+  sink route fnlen testmod threads blocking workers globals forks fxlanes tmppath menudoors paging allowlist-counts)
 deps_usage() {
   echo "check-deps: $*" >&2
   echo "usage: ci/check-deps.sh [--only RULE[,RULE...] | --list-rules]" >&2
@@ -1476,7 +1486,7 @@ fork_scope_re=$(scope_re "${FORK_SCOPE[@]}")
 # has a line that could hold a site of that rule, and ci/ledger.awk then decides what is really one; a
 # file the pattern misses cannot hold one. W and G read the machines, F the fork scope.
 workers_pat='spawn_small|spawn_sized|spawn_off_frame|submit_retained|submit_ticket|task::(spawn|\{|\*)|storage_worker::(submit|\{|\*)|(task|storage_worker)[[:space:]]+as[[:space:]]'
-globals_pat='client_for|current_server|current_snapshot|keypin::(revision|blocked_for|\{|\*)|session::(peek|current_gen|screen_input_revision|\{|\*)|grant::(offers|\{|\*)|(^|[^A-Za-z0-9_])transport::(viewer_paused|\{|\*)|(^|[^A-Za-z0-9_])preview::(paused|\{|\*)|player::TX|devcaps::(caps|\{|\*)|is_dp_audio|(^|[^A-Za-z0-9_])tape::(active|\{|\*)|(^|[^A-Za-z0-9_])(sidecar|ass_source)::(takes_colour|selected|\{|\*)|server_ids|server_roster_gen|server_facts_gen|server_probe_result|peek_settled|screen_input_revision|(session|keypin|grant|player|transport|preview|devcaps|tape|sidecar|ass_source|caps|is_dp_audio|is_dp_audio_track|peek|peek_settled|current_gen|screen_input_revision|revision|blocked_for|offers|paused|viewer_paused|TX|server_ids|server_roster_gen|server_facts_gen|server_probe_result)[[:space:]]+as[[:space:]]'
+globals_pat='client_for|current_server|current_snapshot|chosen_version|chosen_for|keypin::(revision|blocked_for|\{|\*)|session::(peek|current_gen|screen_input_revision|\{|\*)|grant::(offers|\{|\*)|(^|[^A-Za-z0-9_])transport::(viewer_paused|\{|\*)|(^|[^A-Za-z0-9_])preview::(paused|\{|\*)|player::TX|devcaps::(caps|\{|\*)|is_dp_audio|(^|[^A-Za-z0-9_])tape::(active|\{|\*)|(^|[^A-Za-z0-9_])(sidecar|ass_source)::(takes_colour|selected|\{|\*)|server_ids|server_roster_gen|server_facts_gen|server_probe_result|peek_settled|screen_input_revision|(session|keypin|grant|player|transport|preview|devcaps|tape|sidecar|ass_source|caps|is_dp_audio|is_dp_audio_track|peek|peek_settled|current_gen|screen_input_revision|revision|blocked_for|offers|paused|viewer_paused|TX|server_ids|server_roster_gen|server_facts_gen|server_probe_result)[[:space:]]+as[[:space:]]'
 # a cfg line: one with `test` on it, or an attribute / `cfg!` that opens on one line and closes on a later
 # one, where `test` may sit on the second. A line that is a test-only attribute outright — `#[cfg(test)]`,
 # `#[cfg(any(test, feature = "test-support"))]`, or an `all(<either>, <flat atoms>)` of them — is no
@@ -1557,7 +1567,12 @@ fi # workers
 # coverage expansion that recorded the reads already there. So do the subtitle registries' colour-pick readers
 # `sidecar::takes_colour(` / `sidecar::selected(` / `ass_source::takes_colour(` / `ass_source::selected(`: the
 # Subtitles menu read them through a media free function before the fact became a readout value the app
-# delivers (`player::deliver_subtitle_ink`); no machine holds a site, so the names seeded no ledger line. The settings getters (`route::*`) and `i18n::current` are
+# delivers (`player::deliver_subtitle_ink`); no machine holds a site, so the names seeded no ledger line.
+# `chosen_version(` / `chosen_for(`, the `version_choices` memory's mirror read (what a Play of an item starts and the
+# Detail facts line describes), are spellings like `client_for`: the screens that show it (Detail, the item menu, the Select
+# Version panel) are no machines, so no ledger line was seeded, and a machine that read it would have to take the value
+# as an argument the way the resolve takes `ResolveEnv::picks` and `version` (the other tenants are read at the request,
+# `recalled_track_memory`). The settings getters (`route::*`) and `i18n::current` are
 # deliberately NOT spellings: the owner's architecture board kept settings getters out of this gate, and
 # `i18n::current` is a display read. The device's
 # capability answer is read behind a function too: `devcaps::caps(`, and the zero-argument audio gates
@@ -1769,6 +1784,17 @@ else
 fi
 fi # tmppath
 
+
+# menudoors: see the rule comment at the top. The doors' own files are named here, by design and
+# not by allowlist: they are the component and the three types it is built from.
+if want menudoors; then
+menudoors_hits=$(grep_code '\bset_title\(|\bwith_compact\(|\.compact[[:space:]]*=[^=]|\b(PageStack|PanelMotion)(::<[^>]*>)?::(new|default)\b' "$SRC" "$SRC_BASE" "$SRC_MACHINE" "$SRC_OS" "$SRC_GFX" "$SRC_NET" "$SRC_UI" "$SRC_PLEX" "$SRC_TELEMETRY" "$SRC_DATA" "$SRC_SESSION" "$SRC_MEDIA" "$SRC_PLAYBACK_CONTRACT" "$SRC_PLAY_URI" "$SRC_PLAY_FEED" "$SRC_MEDIA_CODECS" "$SRC_APPKIT" "$SRC_SCREENS" "$SRC_OWP" "$SRC_SHELL_SDL" "$SRC_PLATFORM_WEBOS" "$SRC_PLATFORM_DESKTOP" "$SRC_PLATFORM_TIZEN" \
+  | grep -vE "^$SRC_UI/(menu|menu_tests|table|page_stack|panel_motion)\.rs:" || true)
+if [ -z "$menudoors_hits" ]; then ok "menudoors"; else
+  echo "$menudoors_hits" | sed 's/^/    /'
+  fail "menudoors: $(echo "$menudoors_hits" | wc -l | tr -d ' ') line(s) build a menu outside plx_ui::menu::Menu (set_title / .compact = / with_compact / PageStack::new / PanelMotion::new)"
+fi
+fi # menudoors
 
 # paging: the two Plex paging parameter names are spelled in ONE non-test file, the `paged_path`
 # primitive (rust-modules/plex/src/plex/paging.rs). Any other production string that spells one is a

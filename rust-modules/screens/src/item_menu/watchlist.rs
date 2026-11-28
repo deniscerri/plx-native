@@ -1,15 +1,16 @@
 //! The menu's Watchlist rows (plan §1.7-§1.9): Add / Remove on a card, an episode or a season,
 //! and the membership-aware tail of the Catalog menu.
 //!
-//! Everything a row needs is a [`Face`] **captured when the menu opened** — the catalog id, the
+//! Membership-aware rows use a [`Face`] **captured when the menu opened** — the catalog id, the
 //! membership as the store read it THEN, and what the subject is. Nothing here reads a store at
 //! press time, so a list that changes under an open panel cannot re-point a row.
 //!
-//! **No face, no row.** The app hands a face only when the account's Watchlist can be reached
+//! **No face, no membership row.** The app hands a face only when the account's Watchlist can be reached
 //! (plex.tv answered and the title's guid is known), so an unreachable service omits the row
 //! rather than offering a press that can only fail. An UNKNOWN membership is not unreachable: it
 //! wears the Add face, because the PUT is idempotent.
-use std::convert::Infallible;
+//! Filmography's add-only menu uses its captured catalog ID directly; it needs no membership face.
+use super::MenuPage;
 
 use plx_data::catalog::Membership;
 use plx_data::watchlist::model::Kind;
@@ -46,7 +47,7 @@ pub fn hex_of(guid: &str) -> Option<[u8; 12]> {
 
 type Built = (ItemRow, Action, Row);
 
-fn add_row(hex: [u8; 12], show_label: bool) -> Built {
+pub(super) fn add_row(hex: [u8; 12], show_label: bool) -> Built {
     let label = if show_label {
         plx_os::i18n::msg::watchlist_action_add_show()
     } else {
@@ -75,8 +76,8 @@ pub fn face_row(face: &Face) -> Built {
 
 /// Add `face`'s row to `sec`, or leave it alone with no face (service unreachable).
 pub fn push_face(
-    sec: FormSection<ItemRow, Action, Infallible>, face: Option<&Face>,
-) -> FormSection<ItemRow, Action, Infallible> {
+    sec: FormSection<ItemRow, Action, MenuPage>, face: Option<&Face>,
+) -> FormSection<ItemRow, Action, MenuPage> {
     match face {
         Some(f) => {
             let (id, action, row) = face_row(f);

@@ -1178,13 +1178,13 @@ mod tests {
         assert_eq!(FROZEN_CENSUS.lines().count(), compared, "the frozen file holds one line per case");
     }
 
-    /// Catalan and Albanian are newer than the frozen hand-written census. Check every such language's
+    /// Catalan, Croatian and Albanian are newer than the frozen hand-written census. Check every such language's
     /// live renderer output for every reachable frame without fabricating historical hashes.
     #[test]
     fn languages_newer_than_the_census_render_every_case() {
         let frozen = frozen_census_languages();
         let newer: Vec<Preference> = SHIPPED.iter().copied().filter(|language| !frozen.contains(language)).collect();
-        assert!(newer.contains(&Preference::Ca) && newer.contains(&Preference::Sq), "{newer:?}");
+        assert!(newer.contains(&Preference::Ca) && newer.contains(&Preference::Hr) && newer.contains(&Preference::Sq), "{newer:?}");
         for language in newer {
             let _language = language_on_this_thread_for_test(language);
             let cx = plx_os::i18n::current();

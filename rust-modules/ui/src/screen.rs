@@ -39,16 +39,14 @@ pub enum RenderStrategy {
 /// It is a REQUEST rather than a drawing, and that is the whole of why this type exists. The dim
 /// sits between the page and the surface's own glass, so it is part of what that glass looks
 /// through — which means it has to be on the framebuffer *before* the surface's glass grabs its
-/// backdrop, i.e. inside the page pass, several call frames away from the surface that owns it.
-/// The surface therefore states its weight here and the container
-/// ([`ModalStack::draw_scrims`](crate::containers::modal::ModalStack::draw_scrims)) draws it,
-/// in one place, for every surface, in phase order.
+/// backdrop. The container draws it at the end of the page pass, or in the surface pass
+/// when an opaque surface supplies the ground underneath the panel.
 ///
 /// **The weight is a ROLE, and the ink is the page's own light.** `alpha` is one of the
 /// `theme::underlay::DIM_*` rows — no surface states a number of its own — and the container paints
 /// it through the stack's one `UnderlayField` (`containers::modal::ModalUnderlay`) as
 /// `Role::Dim { weight: theme::underlay::TINT }`, latched from the undimmed host page (or, over the
-/// video plane, [`UnderlaySource::Flat`], the neutral ink). So the dim keeps the page's colour where the
+/// video plane or above an opaque surface, flat neutral ink). So the dim keeps the page's colour where the
 /// page has it; at `TINT == 0` it is the flat `theme::scrim_black` rect to the bit.
 ///
 /// A surface that wants no dim overrides nothing: [`Screen::scrim`] defaults to [`Scrim::NONE`].
@@ -64,6 +62,10 @@ pub struct Scrim {
     /// The surface's OWN 0..1 ramp for the dim, when it has one: the container uses it in place of
     /// the surface's appear spring ([`Scrim::following`]). `None` = the appear spring.
     pub ramp: Option<f32>,
+    /// The dim exists only where the surface's host is a held page ([`Scrim::over_host`]): the
+    /// container answers it with no dim at all for a style that leaves its host live
+    /// ([`crate::containers::modal::style_caches_host`]).
+    pub host_only: bool,
 }
 
 /// **What a surface's dim inherits.** A dim here is not a black sheet: the container paints it
@@ -86,6 +88,7 @@ impl Scrim {
         alpha: 0.0,
         source: UnderlaySource::Page,
         ramp: None,
+        host_only: false,
     };
 
     /// A dim of `alpha`. `alpha` is a `theme::underlay::DIM_*`
@@ -93,8 +96,25 @@ impl Scrim {
     pub const fn dim(alpha: f32) -> Scrim {
         Scrim {
             alpha,
-                source: UnderlaySource::Page,
+            source: UnderlaySource::Page,
             ramp: None,
+            host_only: false,
+        }
+    }
+
+    /// A dim of `alpha` over the host PAGE, asked only where the host IS a held page: the glass
+    /// ground's own condition. A glass panel stands on the frozen host (`popover_glass`), and the
+    /// field it stands on latches only under a page-sourced dim, so a panel that is glass over a page
+    /// and the flat sheet over the video plane (Live TV's number entry) declares ONE dim, and the
+    /// container drops it for the style that has no page to hold (`Style::PlayerPanel`, host live):
+    /// there is then no latch, no dim on the picture and no glass. The answer follows the surface's
+    /// style, which is fixed for its life, never the plane's bound bit, which is not.
+    pub const fn over_host(alpha: f32) -> Scrim {
+        Scrim {
+            alpha,
+            source: UnderlaySource::Page,
+            ramp: None,
+            host_only: true,
         }
     }
 
@@ -104,8 +124,9 @@ impl Scrim {
     pub const fn over_video(alpha: f32) -> Scrim {
         Scrim {
             alpha,
-                source: UnderlaySource::Flat,
+            source: UnderlaySource::Flat,
             ramp: None,
+            host_only: false,
         }
     }
 
@@ -113,7 +134,7 @@ impl Scrim {
     /// morphing menu's dim follows its MORPH (`Popover::dim`), so the page dims as the glass grows
     /// and clears as the slab drains, not on a clock of its own.
     pub const fn following(self, ramp: f32) -> Scrim {
-        Scrim { alpha: self.alpha, source: self.source, ramp: Some(ramp) }
+        Scrim { ramp: Some(ramp), ..self }
     }
 }
 
@@ -272,10 +293,12 @@ pub trait Screen<H: Host>: Machine<H, Ev = ScreenEvent<H>> + Focusable<H> {
     fn bar_opener(&self) -> Option<H::Elem> {
         None
     }
-    /// **Where the bar member this surface hangs from is DRAWN this frame** (its rest rect through
-    /// the host page's tuck, the same rect the lift draws at), handed to the surface before every
-    /// draw so its morph starts and ends on the live opener, not on a rect measured once at mount.
-    /// Called only for a surface that answers [`bar_opener`](Self::bar_opener).
+    /// **Where the opener this surface hangs from is DRAWN this frame**, handed to the surface before every
+    /// draw so its morph starts and ends on the live opener, not on a rect measured once at mount: a bar
+    /// member's rect through the host page's tuck (the same rect the lift draws at), or, for a page element
+    /// ([`opener`](Self::opener)), the host page's `Focusable::place` of it at `At::Drawn` (the control's plate:
+    /// a header pill that rides its page moves under its menu). Called only for a surface that answers one of
+    /// the two.
     fn opener_rect(&mut self, _drawn: crate::Rect) {}
     /// **How much of the opener this surface leaves**, 1.0 (whole, the default) .. 0.0 (consumed):
     /// the lift pass (`Z::OPENER`) paints the opener it lifts at this alpha. A MORPHING menu answers
@@ -391,6 +414,25 @@ pub struct ReturnState<K, M = ()> {
     /// raised — tier 2's answer to "where was this page standing" for whatever a screen's `focus`
     /// and `scroll` alone cannot say (spec §6.1; e.g. Detail's season/column/sub-row `Spot`).
     pub memory: M,
+    /// **Routing, not state**: the entry that held input when this was captured
+    /// (`Dispatcher::return_state`'s `owner_entry()`), carried with the value wherever it goes (the
+    /// app's command and back into `request_with_return`) so the one rule "a `ret` lands where it
+    /// was captured" (`Navigation::captured_on`) never has to guess from `focus`. Not part of
+    /// [`RETURN_STATE_SHAPE`]: it is never recorded or hashed. `None` lands nowhere.
+    ///
+    /// **The one carrier.** `Navigation::request`/`back` read it from here (the parked op carries only
+    /// the `ret`), and it is a property of a `ret` IN FLIGHT: a `ret` stored on an `Entry` has been
+    /// through [`Self::stored`] (by `Entry::store_ret`, the one whole-value writer), which clears it, so
+    /// `Entry.ret` never carries a stale stamp.
+    pub captured: Option<EntryId>,
+}
+
+impl<K, M> ReturnState<K, M> {
+    /// This `ret` as an `Entry` stores it: the routing stamp is spent once the `ret` has landed.
+    pub fn stored(mut self) -> Self {
+        self.captured = None;
+        self
+    }
 }
 
 pub const RETURN_STATE_SHAPE: &str = "ReturnState{focus:Option<(EntryId,H::Elem)>,remembered:[(GroupId,H::Elem)],scroll:f32,memory:H::Memory}";
@@ -402,6 +444,7 @@ impl<K, M: Default> Default for ReturnState<K, M> {
             remembered: Vec::new(),
             scroll: 0.0,
             memory: M::default(),
+            captured: None,
         }
     }
 }
@@ -1332,6 +1375,9 @@ pub struct Clip {
 pub struct ClipScope {
     prev: Option<Clip>,
     active: bool,
+    /// A recording painter's rounded scope, noted in the draw census (and popped there on drop).
+    #[cfg(any(test, feature = "test-support"))]
+    noted: bool,
 }
 
 thread_local! {
@@ -1366,6 +1412,11 @@ impl ClipScope {
     /// the scissor still intersects.
     pub fn open_rounded_in(p: Painter, r: Rect, radius: f32) -> Self {
         if !crate::frame::backdrop::discovering() && p.is_recording() {
+            #[cfg(any(test, feature = "test-support"))]
+            if p.px(radius) >= 0.5 {
+                crate::draw_census::open_round(p.place(r), p.px(radius));
+                return Self { prev: None, active: false, noted: true };
+            }
             return Self::inert();
         }
         let radius = p.px(radius);
@@ -1383,11 +1434,11 @@ impl ClipScope {
         let clip = Clip { scissor, round: round.or(prev.and_then(|c| c.round)) };
         CLIP_STACK.with(|c| c.set(Some(clip)));
         apply_scissor(Some(clip));
-        Self { prev, active: true }
+        Self { prev, active: true, #[cfg(any(test, feature = "test-support"))] noted: false }
     }
 
     fn inert() -> Self {
-        Self { prev: None, active: false }
+        Self { prev: None, active: false, #[cfg(any(test, feature = "test-support"))] noted: false }
     }
 
     /// The scissor in force (the innermost open scope), for tests and instruments.
@@ -1403,6 +1454,10 @@ impl ClipScope {
 
 impl Drop for ClipScope {
     fn drop(&mut self) {
+        #[cfg(any(test, feature = "test-support"))]
+        if self.noted {
+            crate::draw_census::close_round();
+        }
         if !self.active {
             return;
         }

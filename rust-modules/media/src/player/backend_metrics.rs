@@ -52,8 +52,8 @@ pub fn handled_failure(kind: crate::player::FailureKind) -> m::Failure {
     use crate::player::FailureKind as K;
     use m::{Cause, Stage};
     match kind {
-        K::DecisionRefused => m::Failure { stage: Stage::Planning, cause: Cause::Refused },
-        K::PlaybackPolicy | K::NoVideoTranscodeTarget | K::PreviewNotDirect =>
+        K::DecisionRefused | K::TunersBusy => m::Failure { stage: Stage::Planning, cause: Cause::Refused },
+        K::PlaybackPolicy | K::NoVideoTranscodeTarget | K::PreviewNotDirect | K::NoQualifiedBackend =>
             m::Failure { stage: Stage::Planning, cause: Cause::Unsupported },
         K::NoVideoTrack => m::Failure { stage: Stage::Open, cause: Cause::Unsupported },
         K::MediaSource => m::Failure { stage: Stage::Open, cause: Cause::Unknown },

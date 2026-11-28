@@ -22,7 +22,7 @@
 //!   thread), both bound at run time through `plx_base::dynlib!`; [`surface`], the [`Shell`] and [`Surface`]
 //!   the application drives, with the hand-off between the two threads;
 //! - [`keys`], the remote's key names to the application's `Action`s, and the dump that shows an unbound
-//!   name; [`log_udp`], the event log's tap onto a UDP socket (the emulator has no file access);
+//!   name; [`ime`], the system on-screen keyboard (Ecore IMF, on the host thread); [`log_udp`], the event log's tap onto a UDP socket (the emulator has no file access);
 //! - [`devboot`], the dev-token boot armed from the launch string instead of trigger files;
 //! - [`identity`], the platform name and the locale;
 //! - `player` (the `uri` feature), the Sans-IO URI driver over the host's media player, what the platform certifies
@@ -37,10 +37,12 @@
 mod devboot;
 mod ecore;
 mod egl;
+mod esprobe;
 mod exports;
 mod host_abi;
 mod hosted;
 mod identity;
+mod ime;
 mod keys;
 mod launch;
 mod layout;
@@ -54,7 +56,7 @@ use plx_os::tv::secure::StoreMode;
 use plx_os::tv::{IdentityHooks, Libraries, LegacyWebosMedia, SecureHooks, Services, StorageHooks, SystemHooks};
 use plxnative_modules::host::{self, Platform};
 
-/// The process's one hosted run: the host's callbacks, the input queue, the stop gate. The three exports and
+/// The process's one hosted run: the host's callbacks, the input queue, the stop gate. The four exports and
 /// the Ecore handlers reach it; nothing else does.
 pub(crate) static HOSTED: hosted::Hosted = hosted::Hosted::new();
 
@@ -63,7 +65,8 @@ pub(crate) static HOSTED: hosted::Hosted = hosted::Hosted::new();
 ///
 /// - `identity`: the device probe publishes `Tizen` and the build's platform version; the locale is
 ///   the host's (`DirectoryInfo`'s culture, passed in the launch string); there is no capability probe, no
-///   native video to repair, no device files and no sound-output service.
+///   native video to repair, no device files and no sound-output service; the packet-player probe is
+///   [`esprobe::command`] (Settings > Diagnostics).
 /// - `secure`: no key manager, and `MemoryOnly`: nothing persists a credential on this platform, so a session
 ///   is held for the run and the sign-in is asked again at the next (Decision 7 B).
 /// - `system`: no Home key and no system bus.
@@ -78,6 +81,7 @@ static SERVICES: Services = Services {
         probe_device: identity::probe_device,
         start_capability_probe: IdentityHooks::NONE.start_capability_probe,
         repair_native_video: IdentityHooks::NONE.repair_native_video,
+        packet_probe: Some(esprobe::command),
         device_files: IdentityHooks::NONE.device_files,
         system_locale: identity::system_locale,
         sound_output: IdentityHooks::NONE.sound_output,
@@ -121,6 +125,7 @@ mod tests {
         assert_eq!(SERVICES.secure.mode, StoreMode::MemoryOnly);
         assert_eq!(SERVICES.storage.authority, Authority::Files);
         assert!(SERVICES.identity.repair_native_video.is_none());
+        assert!(SERVICES.identity.packet_probe.is_some(), "Settings > Diagnostics offers the packet-player probe");
         assert!(matches!((SERVICES.identity.sound_output)(), plx_os::tv::sound::Reply::NoPlatform));
         assert_eq!(SERVICES.legacy_webos_media.display_sink.window_mode(), plx_os::tv::sink::VP_NONE);
         assert!(!SERVICES.legacy_webos_media.sink.feed_abi_is_cow(), "the refusing sink, not a native one");

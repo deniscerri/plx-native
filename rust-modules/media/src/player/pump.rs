@@ -269,6 +269,7 @@ fn open_facts(ps: &crate::route::PlaybackSession, native_audio: Option<plx_os::d
         no_frames: ps.readout().raw().frames == 0,
         native_audio,
         forced: crate::route::forced_direct_play(ps),
+        live: crate::route::is_live(ps),
         direct: !crate::route::is_transcoding(ps),
         audio: crate::route::stream_audio(ps),
         video: crate::route::stream_video(ps),
@@ -294,6 +295,18 @@ fn load_refusal(ps: &crate::route::PlaybackSession) -> super::recovery::LoadRefu
         super::recovery::LoadRefusal::TimedOut
     } else {
         super::recovery::LoadRefusal::Refused { num: raw.cb_err_num }
+    }
+}
+
+/// The source's own account of a failed read (`demux_io_failed`, or `demux_failed` before a
+/// picture): a live playlist that stopped advancing, which the demuxer named before it raised the
+/// flag (`FeedRaw::live_stalled`, the flag's own sample), or any other failure of the demuxer or the
+/// transport. The ladder converts a channel for the second and only reads out for the first.
+fn source_refusal(ps: &crate::route::PlaybackSession) -> super::recovery::LoadRefusal {
+    if ps.readout().raw().live_stalled {
+        super::recovery::LoadRefusal::LiveStalled
+    } else {
+        super::recovery::LoadRefusal::SourceFailed
     }
 }
 
@@ -403,6 +416,13 @@ fn drive_open_recovery(ps: &mut crate::route::PlaybackSession, first: super::rec
                     }
                     let secs = (ps.readout().raw().playpos_ns / 1_000_000_000).max(0);
                     crate::route::dispatch_unopened_auto_hls(ps, secs)
+                }
+                RecoveryEffect::LiveTranscode { flight } => {
+                    // A channel's own playlist could not be decoded as emitted (a tune's cut begins
+                    // wherever the tuner was, so it may carry no parameter sets at all). The server is
+                    // already recording that session: read it through the live universal transcoder.
+                    super::log(&format!("open recovery: converting the live channel (flight {flight}/1)"));
+                    crate::route::dispatch_live_refusal_conversion(ps)
                 }
                 RecoveryEffect::DecodeInApp { audio, refusal } => {
                     if let plx_os::devcaps::Facet::Audio { codec, .. } = &audio {
@@ -549,21 +569,27 @@ fn withdraw_dolby_vision(
         pa.feed_command(plx_playback_contract::feed::FeedCommand::DvStandDown);
         return None;
     }
-    let target = if let Some(tap) = super::take_pending_seek(ps, pa) {
-        crate::route::commit_user_seek();
-        tap.target_ns
-    } else {
-        // The feed's in-place target rides the sample (`FeedRaw::seek_target_ns`).
-        let in_place = ps.readout().raw().seek_target_ns.unwrap_or(-1);
-        if w.in_place && in_place >= 0 { in_place } else { w.armed_target.unwrap_or(w.kf_pts) }
-    }
-    .max(0);
+    let target = take_tap_target(ps, pa)
+        .unwrap_or_else(|| {
+            // The feed's in-place target rides the sample (`FeedRaw::seek_target_ns`).
+            let in_place = ps.readout().raw().seek_target_ns.unwrap_or(-1);
+            if w.in_place && in_place >= 0 { in_place } else { w.armed_target.unwrap_or(w.kf_pts) }
+        })
+        .max(0);
     super::log(&format!(
         "dv: withdrawn for this play: {}; reload at {:.3}s without DolbyHdrInfo, the base layer plays",
         w.why,
         target as f64 / 1e9,
     ));
     Some(target)
+}
+
+/// The newest coalesced tap, taken and committed as the seek stuck-watchdog adopts it
+/// (`commit_user_seek` included): where a reload that replaces the Engine goes when one is pending.
+fn take_tap_target(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::PlayerAdapter) -> Option<i64> {
+    let tap = super::take_pending_seek(ps, pa)?;
+    crate::route::commit_user_seek();
+    Some(tap.target_ns)
 }
 
 /// The Engine fails for good: any flight ends, the viewer gets the read-out, and the Engine's
@@ -1140,6 +1166,7 @@ fn pump_frame(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::P
         let snapshot = super::timeline::TimelineSnapshot::from_feed(
             ps.readout(),
             super::duration_ns(ps).unwrap_or(0),
+            crate::route::is_live(ps),
         );
         pa.publish_timeline(attempt, snapshot);
     }
@@ -1197,6 +1224,32 @@ fn pump_frame(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::P
             decode_in_app(ps, pa, offset_ns);
         }
         return;
+    }
+    // ---------- Dolby Vision the server did not report: the demuxer found RPUs in a stream whose
+    // container has no configuration record, so the Load declared none and the panel shows the base
+    // layer. Once the Load has returned (a teardown never waits on one in flight), and outside an
+    // Original trial not yet confirmed (as the plain seek waits for it), the route may declare them
+    // (`route::declare_rpu_dovi`, at most once a play, so this cannot loop) and the play reloads once
+    // with the node, at the newest tap else where this Engine was aimed.
+    let raw = ps.readout().raw();
+    let rpu = if raw.load.load_thread_finished { raw.rpu_dovi } else { None };
+    if let Some(rpu) = rpu {
+        if crate::route::rpu_dovi_open(ps)
+            && !crate::route::flight_outstanding()
+            && !crate::route::original_recovery_pending()
+            && !crate::route::preview_request(ps)
+            && crate::route::declare_rpu_dovi(ps, rpu)
+        {
+            let target = take_tap_target(ps, pa)
+                .unwrap_or_else(|| {
+                    let raw = ps.readout().raw();
+                    raw.seek_target_ns.unwrap_or(raw.playpos_ns)
+                })
+                .max(0);
+            super::log(&format!("dv: reload at {:.3}s with DolbyHdrInfo", target as f64 / 1e9));
+            settle_reload(super::engine::reload_at(ps, pa, target), "Dolby Vision found in the RPUs", ps);
+            return;
+        }
     }
     // ---------- the Dolby Vision landing guard (#1166): a declared landing the firmware's splitter
     // would skip (the keyframe was held back at the landing) or that no position update follows turns
@@ -1289,7 +1342,7 @@ fn pump_frame(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::P
     // line raised the failure read-out on a stream that had been working. A failed recovery is
     // worth a second reload; it is not worth the playback.
     // A worker may publish a more specific terminal code immediately before this generic Release
-    // flag. Acquire is the matching hand-off; `error_now` can then report the transaction cause
+    // flag. Acquire is the matching hand-off; the failure derivation can then report the transaction cause
     // instead of racing it into the generic producer bucket.
     if ps.readout().raw().flags.demux_io_failed {
         if crate::route::preview_request(ps) {
@@ -1297,7 +1350,7 @@ fn pump_frame(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::P
             return;
         }
         let loading = ps.readout().raw().load.loading();
-        let run = recover_failed_open(ps, loading, super::recovery::LoadRefusal::SourceFailed, None, "");
+        let run = recover_failed_open(ps, loading, source_refusal(ps), None, "");
         if let OpenRecoveryRun::DecodeInApp { offset_ns } = run {
             decode_in_app(ps, pa, offset_ns);
         }
@@ -1350,7 +1403,7 @@ fn pump_frame(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::P
             // mismatch to the ordinary failure read-out instead of a loop.
             let _ = settle_reload(super::engine::reload_at(ps, pa, retry_position), "probe retry reload", ps);
         } else {
-            let run = recover_failed_open(ps, loading, super::recovery::LoadRefusal::SourceFailed, None, "");
+            let run = recover_failed_open(ps, loading, source_refusal(ps), None, "");
             if let OpenRecoveryRun::DecodeInApp { offset_ns } = run {
                 decode_in_app(ps, pa, offset_ns);
             }
@@ -1743,7 +1796,8 @@ fn pump_frame(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::P
     // Load and speed policy are settled. Borrow the physical feed for ACB, feeding and EOS.
     let physical = pa.tick_feed_presentation(
         plx_playback_contract::feed::HoldRoute::of(
-            crate::route::is_segmented_hls(ps),
+            // A Live TV direct stream also needs the HLS hold when its playlist stops advancing.
+            crate::route::is_segmented_hls(ps) || crate::route::is_live(ps),
             crate::route::is_preview(ps),
             crate::route::is_progressive_original(ps),
         ),
@@ -2959,11 +3013,11 @@ mod flight_tests {
         assert_eq!(crate::player::state(&rig.ps), crate::player::PlaybackState::Error);
         rig.frame();
         assert!(!rig.pa.is_live(), "the Engine is released, with no recovery attempted");
-        let shape = crate::player::error_now(&rig.ps);
+        let shape = crate::player::error_for_test(&rig.ps);
         assert_eq!(shape.kind, crate::player::FailureKind::ServerStopped);
         assert_eq!(shape.detail, "stopped by the admin");
         assert_eq!(
-            crate::player::failure_actions(shape.kind, crate::player::failure_context(&rig.ps)),
+            crate::player::failure_actions(&crate::player::failure_for_test(&rig.ps), crate::player::LiveOffers { repair_idle: true, tracks_available: false, versions_available: false }),
             vec![crate::player::FailureAction::Back]
         );
     }
@@ -2979,7 +3033,7 @@ mod flight_tests {
         rig.frame();
         assert!(!rig.pa.is_live(), "the stopped replacement still owns its engine");
         assert_eq!(crate::route::unpresented_resume_ns(&rig.ps), 10_000_000_000);
-        assert_eq!(crate::player::error_now(&rig.ps).kind, crate::player::FailureKind::ServerStopped);
+        assert_eq!(crate::player::error_for_test(&rig.ps).kind, crate::player::FailureKind::ServerStopped);
     }
 
     #[test]
@@ -2997,20 +3051,35 @@ mod flight_tests {
         crate::route::drain_scrobble();
     }
 
+    /// **A server's stop note that lands after the failure was captured refines it**: the interrupted stream is the
+    /// stop with its reason, and the settings and offers captured with it stand.
     #[test]
-    fn server_stop_replaces_the_retry_after_the_engine_is_already_released() {
+    fn a_server_stop_after_an_interrupted_capture_refines_it() {
+        use crate::player::{observe_failure, FailureKind, FailureTrigger};
         let mut rig = Rig::new(120);
         FEED_SHARED.frames.store(10, Relaxed);
         FEED_SHARED.demux_io_failed.store(true, Release);
         rig.frame();
         rig.frame();
         assert!(!rig.pa.is_live(), "premise: the interrupted engine was released");
-        assert_eq!(crate::player::error_now(&rig.ps).kind, crate::player::FailureKind::PlaybackInterrupted);
+        let attempt = crate::player::report::attempt_id();
+        observe_failure(&mut rig.ps, FailureTrigger::NONE, attempt);
+        let captured = crate::route::failure(&rig.ps).cloned().expect("the failure is captured once the state is Error");
+        assert_eq!(captured.kind(), FailureKind::PlaybackInterrupted);
 
         crate::player::note_server_stop(&crate::route::sess(&rig.ps), "rig-1", "late termination", 10_000);
-        let shape = crate::player::error_now(&rig.ps);
-        assert_eq!(shape.kind, crate::player::FailureKind::ServerStopped);
-        assert_eq!(shape.detail, "late termination");
+        observe_failure(&mut rig.ps, FailureTrigger::NONE, attempt);
+        let refined = crate::route::failure(&rig.ps).cloned().expect("still captured");
+        assert_eq!(refined.kind(), FailureKind::ServerStopped);
+        assert_eq!(refined.shape().detail, "late termination");
+        assert_eq!(
+            (refined.attempt(), refined.settings(), refined.can_retry(), refined.quality_carriable()),
+            (captured.attempt(), captured.settings(), captured.can_retry(), captured.quality_carriable()),
+            "only the cause is replaced",
+        );
+        // and a frame that changes nothing writes nothing
+        observe_failure(&mut rig.ps, FailureTrigger::NONE, attempt);
+        assert_eq!(crate::route::failure(&rig.ps), Some(&refined));
     }
 
     #[test]
@@ -3036,7 +3105,7 @@ mod flight_tests {
         rig.frames_until("the discarded replacement's stop", |r| replacement_stops(&r.flight) > stops);
         let now = engine_epoch(&mut rig);
         assert!(now.is_none() || now == epoch, "the rollback's landing reloads nothing");
-        assert_eq!(crate::player::error_now(&rig.ps).kind, crate::player::FailureKind::ServerStopped);
+        assert_eq!(crate::player::error_for_test(&rig.ps).kind, crate::player::FailureKind::ServerStopped);
     }
 
     #[test]
@@ -3061,13 +3130,13 @@ mod flight_tests {
         FEED_SHARED.seen_frame.store(true, Release);
         FEED_SHARED.demux_io_failed.store(true, Release);
         rig.pa.publish_feed_attempt_view(&mut rig.ps);
-        let cause_before = crate::player::error_now(&rig.ps).kind;
+        let cause_before = crate::player::error_for_test(&rig.ps).kind;
         rig.frame();
         assert_eq!(crate::player::state(&rig.ps), crate::player::PlaybackState::Error);
         rig.frame();
         assert!(!rig.pa.is_live(), "the failed Engine and its pipeline are released");
         assert_eq!(crate::player::state(&rig.ps), crate::player::PlaybackState::Error, "the read-out stands without an Engine");
-        assert_eq!(crate::player::error_now(&rig.ps).kind, cause_before, "and keeps its cause");
+        assert_eq!(crate::player::error_for_test(&rig.ps).kind, cause_before, "and keeps its cause");
         assert_eq!(
             crate::route::unpresented_resume_ns(&rig.ps),
             60_000_000_000,
@@ -3075,6 +3144,44 @@ mod flight_tests {
         );
         rig.frame();
         assert_eq!(crate::player::state(&rig.ps), crate::player::PlaybackState::Error, "still, a frame later");
+    }
+
+    /// **A channel whose playlist stopped advancing for good ends in the read-out, and its
+    /// conversion is never asked for** (PR #993 review). The maintainer's webOS 4.5 run: a direct
+    /// play's stall was taken for a decode failure, the same recording was converted, and the
+    /// conversion met the same input gap. The demuxer names the stall before the flag that ends the
+    /// read (`FeedRaw::live_stalled`); both travel here through the feed's real sample.
+    #[test]
+    fn a_live_channel_whose_playlist_stalled_reads_out_and_asks_for_no_conversion() {
+        let mut rig = Rig::direct(0);
+        crate::route::mark_live_for_test(&mut rig.ps);
+        let epoch = engine_epoch(&mut rig);
+        FEED_SHARED.frames.store(10, Relaxed);
+        FEED_SHARED.seen_frame.store(true, Release);
+        FEED_SHARED.hls_live_stalled.store(true, Release);
+        FEED_SHARED.demux_io_failed.store(true, Release);
+        rig.frame();
+        assert_eq!(crate::player::state(&rig.ps), crate::player::PlaybackState::Error, "a playback error is shown");
+        assert!(!crate::route::flight_outstanding(), "the conversion is not dispatched");
+        for _ in 0..8 { rig.frame(); }
+        assert_eq!(rig.flight.decisions(), 0, "the server is asked for no conversion decision");
+        assert_eq!(crate::player::state(&rig.ps), crate::player::PlaybackState::Error);
+        let now = engine_epoch(&mut rig);
+        assert!(now.is_none() || now == epoch, "nothing is reloaded");
+    }
+
+    /// The control of the test above: the same channel failing for any other reason (a cut the
+    /// demuxer could not read) still takes its conversion.
+    #[test]
+    fn a_live_channel_whose_read_failed_otherwise_still_takes_its_conversion() {
+        let mut rig = Rig::direct(0);
+        crate::route::mark_live_for_test(&mut rig.ps);
+        FEED_SHARED.frames.store(10, Relaxed);
+        FEED_SHARED.seen_frame.store(true, Release);
+        FEED_SHARED.demux_io_failed.store(true, Release);
+        rig.frame();
+        assert!(crate::route::flight_outstanding(), "a decode failure converts the channel as before");
+        assert_ne!(crate::player::state(&rig.ps), crate::player::PlaybackState::Error);
     }
 
     /// Back from the read-out after the release still ends the playback, once: the real stop runs
@@ -5138,7 +5245,7 @@ mod native_seek_pump_tests {
         assert_eq!(rig.ps.readout().raw().playpos_ns, 9_000_000_000, "the stale position reached the pump");
         assert!(rig.ps.readout().seeking(), "the segment is still awaiting presentation");
         assert!(super::super::timeline::TimelineSnapshot::from_feed(
-            rig.ps.readout(), 7_200_000_000_000,
+            rig.ps.readout(), 7_200_000_000_000, false,
         ).is_none(), "Plex must not save the stale clock");
         assert!(reloads().is_empty(), "presentation gets time to land");
         rig.now += 10_000;
@@ -5146,6 +5253,69 @@ mod native_seek_pump_tests {
             rig.frame();
         }
         assert_eq!(reloads(), vec![target], "reopen succeeded, but the seek needs one fresh Load");
+    }
+
+    /// **A channel read as recorded says "Buffering" when its media runs out, and plays on when the
+    /// recording's input returns** (PR #993 review: Plex waited ~30 s for DVR input and resumed on
+    /// the same encoder). A channel's direct play carries no encode contract, so the feed was told
+    /// it was not segmented, never held its clock, and the picture froze with nothing said. The
+    /// hold is the feed's own (`hls: auto-rebuffer`): the same Engine and session throughout, no
+    /// reload, and the fresh segment that covers the measured runway gives play back.
+    #[test]
+    fn a_live_channel_read_as_recorded_buffers_when_its_media_runs_out_and_resumes() {
+        let _serial = plx_base::testlock::serial();
+        const TAIL_NS: i64 = 60_000_000_000;
+        let mut rig = Rig::new(None);
+        crate::route::mark_live_for_test(&mut rig.ps);
+        assert!(!crate::route::is_segmented_hls(&rig.ps), "premise: a direct play, no encode contract");
+        let epoch = rig.eng().native_epoch;
+        // Past its start, as the Load tick leaves a route it was told is not segmented: its
+        // immediate first Play (`play_initial_now`) cleared the prime and completed the clock's
+        // initial hold, so the clock runs. Pictures are on the panel.
+        rig.eng().prime_play = false;
+        FEED_SHARED.finish_hls_recovery();
+        FEED_SHARED.frames.store(10, Relaxed);
+        FEED_SHARED.seen_frame.store(true, Release);
+        rig.frame();
+        assert_eq!(crate::player::state(&rig.ps), crate::player::PlaybackState::Playing, "premise: it plays");
+        assert_eq!(crate::player::rebuffering(&rig.ps), Some(false), "premise: with nothing held");
+        // The playlist brings nothing new: the playhead reaches the last delivered access unit.
+        FEED_SHARED.hls_video_tail_ns.store(TAIL_NS, Release);
+        FEED_SHARED.hls_audio_tail_ns.store(TAIL_NS, Release);
+        rig.frame();
+        rig.frame();
+        assert_eq!(crate::player::rebuffering(&rig.ps), Some(true), "the feed holds its clock");
+        assert_eq!(crate::player::state(&rig.ps), crate::player::PlaybackState::Buffering);
+        // The gap, however long: nothing fails, nothing reloads, the hold stands.
+        for _ in 0..120 {
+            rig.frame();
+        }
+        assert_eq!(crate::player::state(&rig.ps), crate::player::PlaybackState::Buffering);
+        assert!(reloads().is_empty(), "no reload, no new session");
+        assert_eq!(rig.eng().native_epoch, epoch, "the same Engine");
+        // The recording's input is back: one fresh three-second segment on the same session.
+        FEED_SHARED.observe_hls_recovery(500_000, std::time::Duration::from_secs(3));
+        let au = [0u8; 64];
+        {
+            let mut eng = rig.eng();
+            let qv = &mut **eng.aq_video.as_mut().unwrap() as *mut plx_play_feed::aq::AuQueue;
+            for i in 0..72 {
+                plx_play_feed::aq::aq_push(qv, au.as_ptr(), au.len() as c_int, TAIL_NS + i * V_STEP_NS, c_int::from(i == 0), 1);
+            }
+            let qa = &mut **eng.aq_audio.as_mut().unwrap() as *mut plx_play_feed::aq::AuQueue;
+            for i in 0..140 {
+                plx_play_feed::aq::aq_push(qa, au.as_ptr(), au.len() as c_int, TAIL_NS + i * 21_333_333, 1, 2);
+            }
+        }
+        FEED_SHARED.hls_video_tail_ns.store(TAIL_NS + 3_000_000_000, Release);
+        FEED_SHARED.hls_audio_tail_ns.store(TAIL_NS + 3_000_000_000, Release);
+        for _ in 0..40 {
+            rig.frame();
+        }
+        assert_eq!(crate::player::rebuffering(&rig.ps), Some(false), "fresh media releases the hold");
+        assert_eq!(crate::player::state(&rig.ps), crate::player::PlaybackState::Playing);
+        assert!(reloads().is_empty());
+        assert_eq!(rig.eng().native_epoch, epoch, "still the same Engine");
     }
 
     /// A Segment seek driven to the Play it accepts: returns the native epoch the sink's callbacks
