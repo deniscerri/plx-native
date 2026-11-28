@@ -1,0 +1,9 @@
+{"updated":"2026-11-28T16:02:14Z",
+"ci":[
+{"id":46162257637,"at":"2026-11-28T15:53:48Z","sha":"1ce14a8b0","title":"fix merge conflicts, new strings","pr":null,"conclusion":"failure","attempt":1,"jobs":{"which gates apply":4,"armv7 cross-build and artifact assertions":482,"host unit tests (hostsim)":300,"host lint + type-checks":299,"cross-build (armv7) + artifact assertions":2},"failed":["host checks (NOT a device gate)","host harness tests","host python/shell/C gates","host unit tests (default features)"]}
+],
+"sim":[],
+"nightly":[],
+"cancelled":{},
+"daily":[],
+"flaky":[]}
